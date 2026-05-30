@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin Login — Transcriptr</title>
+<link href="https://fonts.googleapis.com/css2?family=Satoshi:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0f0f0d;color:#f0ede6;font-family:'Satoshi',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#1a1916;border:1px solid rgba(255,255,255,0.08);border-radius:20px;padding:48px 40px;width:100%;max-width:400px}
+.logo{display:flex;align-items:center;gap:10px;margin-bottom:36px;justify-content:center}
+.logo-mark{width:36px;height:36px;background:#d4500a;border-radius:9px;display:flex;align-items:center;justify-content:center}
+.logo-name{font-size:18px;font-weight:700;color:#f0ede6}
+h1{font-size:26px;font-weight:700;text-align:center;margin-bottom:6px}
+.sub{font-size:14px;color:#666;text-align:center;margin-bottom:32px}
+.field{margin-bottom:16px}
+label{font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#888;display:block;margin-bottom:6px}
+input{width:100%;background:#111;border:1.5px solid rgba(255,255,255,0.1);border-radius:12px;padding:13px 16px;color:#f0ede6;font-family:'JetBrains Mono',monospace;font-size:14px;outline:none;transition:border-color .2s}
+input:focus{border-color:#d4500a}
+.btn{width:100%;padding:14px;background:#d4500a;border:none;border-radius:12px;font-family:'Satoshi',sans-serif;font-size:15px;font-weight:700;color:#fff;cursor:pointer;margin-top:8px;transition:background .2s}
+.btn:hover{background:#b8420a}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.err{background:rgba(212,80,10,.1);border:1px solid rgba(212,80,10,.3);border-radius:10px;padding:12px 14px;font-size:13px;color:#f09575;margin-top:14px;display:none}
+.err.show{display:block}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-mark">
+      <svg width="18" height="18" viewBox="0 0 16 16" fill="none">
+        <path d="M1 11L4 5L7 8L10 2L13 7L15 4" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <span class="logo-name">Transcriptr</span>
+  </div>
+  <h1>Admin login</h1>
+  <p class="sub">Secure access only</p>
+  <div class="field">
+    <label>Username</label>
+    <input type="text" id="u" autocomplete="username" autofocus placeholder="admin">
+  </div>
+  <div class="field">
+    <label>Password</label>
+    <input type="password" id="p" autocomplete="current-password" placeholder="••••••••">
+  </div>
+  <button class="btn" id="btn" onclick="login()">Sign in →</button>
+  <div class="err" id="err"></div>
+</div>
+<script>
+document.addEventListener('keydown', e => { if(e.key==='Enter') login(); });
+async function login() {
+  const u=document.getElementById('u').value.trim(), p=document.getElementById('p').value;
+  const btn=document.getElementById('btn'), err=document.getElementById('err');
+  if(!u||!p){showErr('Enter username and password.');return;}
+  btn.disabled=true; btn.textContent='Signing in...'; err.classList.remove('show');
+  try {
+    const res=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({username:u,password:p})});
+    const data=await res.json();
+    if(res.ok){window.location.href='/admin';}
+    else{showErr(data.error||'Login failed.'); btn.disabled=false; btn.textContent='Sign in →';}
+  } catch(e){showErr('Connection error.'); btn.disabled=false; btn.textContent='Sign in →';}
+}
+function showErr(msg){const el=document.getElementById('err');el.textContent=msg;el.classList.add('show');}
+</script>
+</body>
+</html>
