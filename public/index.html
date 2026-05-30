@@ -1673,6 +1673,13 @@ window.runTranscription = async function() {
   const withSum = document.getElementById('chip-sum').classList.contains('on');
   const lang    = document.getElementById('lang-select') ? document.getElementById('lang-select').value : 'auto';
 
+  // YouTube links can't be fetched by our server (IP-blocked) or the browser (CORS-blocked),
+  // so hand them to the smooth download-then-transcribe flow instead of the failing server route.
+  if (!currentFile && /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)/.test(urlVal)) {
+    window.startYouTubeFlow(urlVal);
+    return;
+  }
+
   clearErr();
   goBtn.disabled = true;
   document.getElementById('result-wrap').classList.remove('show');
@@ -1783,48 +1790,76 @@ window.runTranscription = async function() {
   }
 };
 
-// Friendly fallback shown when a YouTube video is too long to transcribe directly
-window.showYouTubeFallback = function(url) {
+// YouTube transcription flow.
+// Google blocks our server's IP for fetching audio, AND blocks browser fetches via CORS,
+// so we can't pull the audio programmatically. Instead we auto-download the audio for the
+// user (the same reliable method the downloader uses) and let them drop it straight into
+// Whisper -- one click, no raw error.
+window.startYouTubeFlow = function(url) {
   var id = '';
   var m = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([^&\n?#]+)/);
   if (m) id = m[1];
+
   var box = document.getElementById('err-box');
   if (!box) return;
-  var L = (window.I18N_FALLBACK && window.I18N_FALLBACK[localStorage.getItem('lang')||'nl']) || window.I18N_FALLBACK.en;
+
+  // Kick off the audio download right away (browser navigation is NOT CORS-blocked).
+  // format=mp3 returns an audio-only file that Whisper accepts.
+  if (id) { try { window.open('/api/youtube/stream/' + id + '?format=mp3', '_blank'); } catch (e) {} }
+
+  var L = (window.I18N_YT && window.I18N_YT[localStorage.getItem('lang') || 'nl']) || window.I18N_YT.en;
+
   box.innerHTML =
     '<div style="text-align:left">' +
       '<div style="font-weight:700;margin-bottom:6px">' + L.title + '</div>' +
-      '<div style="font-size:13px;margin-bottom:12px;opacity:.9">' + L.body + '</div>' +
-      '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
-        '<button id="fb-dl-mp3" style="background:var(--accent);color:#fff;border:none;border-radius:9px;padding:10px 16px;font-family:inherit;font-size:13px;font-weight:700;cursor:pointer">' + L.btn + '</button>' +
-        '<button id="fb-upload" style="background:transparent;color:var(--accent);border:1.5px solid var(--accent);border-radius:9px;padding:10px 16px;font-family:inherit;font-size:13px;font-weight:700;cursor:pointer">' + L.upload + '</button>' +
+      '<div style="font-size:13px;margin-bottom:12px;opacity:.9;line-height:1.5">' + L.body + '</div>' +
+      '<button id="yt-pick" style="background:var(--accent);color:#fff;border:none;border-radius:9px;padding:11px 18px;font-family:inherit;font-size:14px;font-weight:700;cursor:pointer">' + L.pick + '</button>' +
+      '<div style="font-size:12px;margin-top:10px;opacity:.7">' + L.hint + '</div>' +
+      '<div style="font-size:12px;margin-top:8px">' +
+        '<a id="yt-open-dl" href="javascript:void(0)" style="color:var(--accent);text-decoration:underline;cursor:pointer">' + L.manual + '</a>' +
       '</div>' +
     '</div>';
   box.classList.add('show');
-  var dl = document.getElementById('fb-dl-mp3');
-  if (dl) dl.onclick = function(){
-    // Send the user to the YT Downloader page (which works reliably),
-    // pre-fill the URL, and auto-load the download links.
-    showSection('downloader');
+
+  // Primary action: pick the downloaded file -> transcribe immediately (no extra click).
+  var pick = document.getElementById('yt-pick');
+  if (pick) pick.onclick = function() {
+    var inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = 'audio/*,video/*';
+    inp.style.display = 'none';
+    document.body.appendChild(inp);
+    inp.onchange = function() {
+      if (inp.files && inp.files[0]) {
+        clearErr();
+        setFile(inp.files[0]);
+        window.runTranscription();
+      }
+      setTimeout(function(){ inp.remove(); }, 0);
+    };
+    inp.click();
+  };
+
+  // Safety net: if the auto-download didn't start, open the full downloader page.
+  var openDl = document.getElementById('yt-open-dl');
+  if (openDl) openDl.onclick = function() {
+    if (window.showSection) window.showSection('downloader');
     var ytIn = document.getElementById('yt-dl-url');
     if (ytIn) ytIn.value = url;
     window.scrollTo(0, 0);
     setTimeout(function(){ if (window.ytDlFetch) window.ytDlFetch(); }, 300);
   };
-  var up = document.getElementById('fb-upload');
-  if (up) up.onclick = function(){
-    box.classList.remove('show');
-    var inp = document.getElementById('file-in');
-    if (inp) inp.click();
-  };
 };
-window.I18N_FALLBACK = {
-  en: { title: '⏱ This video is a bit long for instant transcription', body: 'No problem! Click below to download the audio as MP3, then come back here and upload that file to transcribe it.', btn: '⬇ Download MP3', upload: '⬆ Upload a file' },
-  nl: { title: '⏱ Deze video is iets te lang voor directe transcriptie', body: 'Geen probleem! Klik hieronder om de audio als MP3 te downloaden, kom dan terug en upload dat bestand om het te transcriberen.', btn: '⬇ Download MP3', upload: '⬆ Bestand uploaden' },
-  de: { title: '⏱ Dieses Video ist etwas lang für die Sofort-Transkription', body: 'Kein Problem! Klicken Sie unten, um das Audio als MP3 herunterzuladen, und laden Sie diese Datei dann hier hoch.', btn: '⬇ MP3 herunterladen', upload: '⬆ Datei hochladen' },
-  fr: { title: '⏱ Cette vidéo est un peu longue pour une transcription instantanée', body: 'Pas de souci ! Cliquez ci-dessous pour télécharger l\'audio en MP3, puis revenez ici et importez ce fichier.', btn: '⬇ Télécharger le MP3', upload: '⬆ Importer un fichier' },
-  es: { title: '⏱ Este vídeo es un poco largo para transcripción instantánea', body: '¡Sin problema! Haz clic abajo para descargar el audio como MP3, luego vuelve aquí y sube ese archivo.', btn: '⬇ Descargar MP3', upload: '⬆ Subir un archivo' },
-  tr: { title: '⏱ Bu video anında yazıya dökmek için biraz uzun', body: 'Sorun değil! Sesi MP3 olarak indirmek için aşağıya tıklayın, sonra buraya dönüp o dosyayı yükleyin.', btn: '⬇ MP3 indir', upload: '⬆ Dosya yükle' }
+// Backwards-compatible alias (older code paths call showYouTubeFallback).
+window.showYouTubeFallback = window.startYouTubeFlow;
+
+window.I18N_YT = {
+  en: { title: 'One quick step for YouTube', body: 'YouTube doesn\'t allow direct transcription, so we\'ve started downloading the audio for you. When it finishes saving, click below and choose that file -- we\'ll transcribe it automatically.', pick: 'Choose the downloaded audio', hint: 'It saves to your Downloads folder, usually named after the video.', manual: 'Download didn\'t start? Open the downloader' },
+  nl: { title: 'Nog \u00e9\u00e9n snelle stap voor YouTube', body: 'YouTube staat directe transcriptie niet toe, dus we zijn de audio voor je aan het downloaden. Klik hieronder zodra het bestand is opgeslagen en kies dat bestand \u2014 we transcriberen het automatisch.', pick: 'Kies het gedownloade audiobestand', hint: 'Het wordt opgeslagen in je map Downloads, meestal met de videotitel als naam.', manual: 'Download niet gestart? Open de downloader' },
+  de: { title: 'Ein kurzer Schritt f\u00fcr YouTube', body: 'YouTube erlaubt keine direkte Transkription, daher haben wir den Download der Audiodatei gestartet. Sobald sie gespeichert ist, klicken Sie unten und w\u00e4hlen Sie diese Datei \u2014 wir transkribieren sie automatisch.', pick: 'Heruntergeladene Audiodatei ausw\u00e4hlen', hint: 'Sie wird im Ordner Downloads gespeichert, meist mit dem Videotitel als Namen.', manual: 'Download nicht gestartet? Downloader \u00f6ffnen' },
+  fr: { title: 'Une \u00e9tape rapide pour YouTube', body: 'YouTube n\'autorise pas la transcription directe, nous avons donc lanc\u00e9 le t\u00e9l\u00e9chargement de l\'audio. Une fois le fichier enregistr\u00e9, cliquez ci-dessous et choisissez-le \u2014 nous le transcrirons automatiquement.', pick: 'Choisir l\'audio t\u00e9l\u00e9charg\u00e9', hint: 'Il est enregistr\u00e9 dans votre dossier T\u00e9l\u00e9chargements, g\u00e9n\u00e9ralement nomm\u00e9 d\'apr\u00e8s la vid\u00e9o.', manual: 'Le t\u00e9l\u00e9chargement n\'a pas d\u00e9marr\u00e9 ? Ouvrir le t\u00e9l\u00e9chargeur' },
+  es: { title: 'Un paso r\u00e1pido para YouTube', body: 'YouTube no permite la transcripci\u00f3n directa, as\u00ed que hemos empezado a descargar el audio. Cuando termine de guardarse, haz clic abajo y elige ese archivo \u2014 lo transcribiremos autom\u00e1ticamente.', pick: 'Elegir el audio descargado', hint: 'Se guarda en tu carpeta de Descargas, normalmente con el nombre del v\u00eddeo.', manual: '\u00bfNo empez\u00f3 la descarga? Abrir el descargador' },
+  tr: { title: 'YouTube i\u00e7in h\u0131zl\u0131 bir ad\u0131m', body: 'YouTube do\u011frudan yaz\u0131ya d\u00f6kmeye izin vermiyor, bu y\u00fczden sesi sizin i\u00e7in indirmeye ba\u015flad\u0131k. Dosya kaydedildikten sonra a\u015fa\u011f\u0131ya t\u0131klay\u0131p o dosyay\u0131 se\u00e7in \u2014 otomatik olarak yaz\u0131ya d\u00f6kece\u011fiz.', pick: '\u0130ndirilen sesi se\u00e7', hint: 'Genellikle video ad\u0131yla \u0130ndirilenler klas\u00f6r\u00fcn\u00fcze kaydedilir.', manual: '\u0130ndirme ba\u015flamad\u0131 m\u0131? \u0130ndiriciyi a\u00e7' }
 };
 
 function setProg(val, label) {
