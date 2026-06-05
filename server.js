@@ -60,14 +60,14 @@ app.use((req, res, next) => {
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; " +
-    "script-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+    "script-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://www.googletagmanager.com https://www.googleadservices.com https://www.google-analytics.com; " +
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; " +
     "font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; " +
-    "img-src 'self' data: blob: https://img.youtube.com; " +
-    "connect-src 'self' https://api.openai.com https://api.anthropic.com https://*.supabase.co; " +
+    "img-src 'self' data: blob: https://img.youtube.com https://www.googletagmanager.com https://www.google-analytics.com https://*.google-analytics.com https://www.google.com https://googleads.g.doubleclick.net https://*.g.doubleclick.net; " +
+    "connect-src 'self' https://api.openai.com https://api.anthropic.com https://*.supabase.co https://www.googletagmanager.com https://www.google-analytics.com https://*.google-analytics.com https://*.analytics.google.com https://www.google.com https://googleads.g.doubleclick.net https://*.g.doubleclick.net https://*.googleadservices.com https://pagead2.googlesyndication.com; " +
     "media-src 'self' blob:; " +
     "worker-src 'self' blob:; " +
-    "frame-src 'none'; " +
+    "frame-src https://td.doubleclick.net https://www.googletagmanager.com; " +
     "object-src 'none';"
   );
   next();
