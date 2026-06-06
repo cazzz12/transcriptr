@@ -1037,6 +1037,7 @@ footer {
         <span>Sign in</span>
       </button>
       <div id="user-chip" style="display:none;align-items:center;gap:10px">
+        <button onclick="window.openMyTranscripts()" style="background:#fff;border:2px solid var(--accent);border-radius:100px;padding:6px 14px;cursor:pointer;font-family:'Satoshi',sans-serif;font-size:12px;font-weight:600;color:var(--ink)">My Transcripts</button>
         <span id="user-email" style="font-size:13px;font-weight:600;color:var(--ink);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
         <button onclick="window.signOutUser()" style="background:none;border:2px solid rgba(26,24,20,.12);border-radius:100px;padding:6px 14px;cursor:pointer;font-family:'Satoshi',sans-serif;font-size:12px;font-weight:600;color:var(--ink)">Sign out</button>
       </div>
@@ -1793,7 +1794,8 @@ window.runTranscription = async function() {
       fd2.append('speakers', withSpk ? 'true' : 'false');
       fd2.append('language', lang);
       setProg(40, 'Transcribing with Whisper AI...'); setSteps(['done','done','active','','']);
-      var sRes = await fetch('/api/transcribe', { method: 'POST', headers: { 'X-Requested-With': 'fetch' }, body: fd2 });
+      var authH = (window.getAuthHeader ? await window.getAuthHeader() : {});
+      var sRes = await fetch('/api/transcribe', { method: 'POST', headers: Object.assign({ 'X-Requested-With': 'fetch' }, authH), body: fd2 });
       if (!sRes.ok) { var se = await sRes.json().catch(()=>({})); if (sRes.status===429) throw new Error('Daily limit reached.'); throw new Error(se.error || 'Transcription failed.'); }
       data = await sRes.json();
     }
@@ -2631,6 +2633,9 @@ function audioBufferToWav(buffer) {
   window.signOutUser = function(){
     sb.auth.signOut().then(function(){ updateAuthUI(null); });
   };
+  window.getAuthHeader = async function(){
+    try { var r = await sb.auth.getSession(); var s = (r && r.data) ? r.data.session : null; return s ? { 'Authorization': 'Bearer ' + s.access_token } : {}; } catch(e){ return {}; }
+  };
 
   sb.auth.getSession().then(function(res){
     updateAuthUI(res && res.data ? res.data.session : null);
@@ -2639,6 +2644,90 @@ function audioBufferToWav(buffer) {
   sb.auth.onAuthStateChange(function(_event, session){
     updateAuthUI(session);
   });
+})();
+</script>
+<!-- ===== My Transcripts modal (end-user accounts) ===== -->
+<div id="mytx-overlay" style="display:none;position:fixed;inset:0;background:rgba(26,24,20,.5);z-index:9998;backdrop-filter:blur(2px)" onclick="if(event.target===this)window.closeMyTranscripts()">
+  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:min(720px,92vw);max-height:86vh;background:#fff;border-radius:24px;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 30px 80px rgba(0,0,0,.25)">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:20px 24px;border-bottom:1px solid var(--border,#eee)">
+      <div style="font-family:'Clash Display',sans-serif;font-size:22px;font-weight:700">My Transcripts</div>
+      <button onclick="window.closeMyTranscripts()" style="background:none;border:none;cursor:pointer;font-size:26px;line-height:1;color:var(--ink2,#777);padding:0 6px">&times;</button>
+    </div>
+    <div id="mytx-body" style="padding:18px 24px;overflow-y:auto"></div>
+  </div>
+</div>
+<script>
+(function(){
+  function fmtDate(s){ try { return new Date(s).toLocaleString(); } catch(e){ return s||''; } }
+  function esc(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  async function tok(){ try { var r = await window._sb.auth.getSession(); return (r && r.data && r.data.session) ? r.data.session.access_token : null; } catch(e){ return null; } }
+  function dl(name, text){
+    var b = new Blob([text], { type:'text/plain;charset=utf-8' });
+    var u = URL.createObjectURL(b); var a = document.createElement('a');
+    a.href = u; a.download = name; document.body.appendChild(a); a.click();
+    setTimeout(function(){ URL.revokeObjectURL(u); a.remove(); }, 100);
+  }
+  function msg(t, color){ return '<div style="padding:34px 0;text-align:center;color:'+(color||'var(--ink2,#777)')+'">'+t+'</div>'; }
+
+  window.openMyTranscripts = async function(){
+    var ov = document.getElementById('mytx-overlay'); var body = document.getElementById('mytx-body');
+    if (!ov || !body) return;
+    ov.style.display = 'block'; document.body.style.overflow = 'hidden';
+    body.innerHTML = msg('Loading…');
+    var t = await tok();
+    if (!t){ body.innerHTML = msg('Please sign in to see your transcripts.'); return; }
+    try {
+      var res = await fetch('/api/transcribe/mine', { headers: { 'Authorization':'Bearer '+t, 'X-Requested-With':'fetch' } });
+      var d = await res.json();
+      if (!res.ok) throw new Error(d.error || 'Failed');
+      var items = d.items || [];
+      if (!items.length){ body.innerHTML = msg('No transcripts yet. Transcribe a file while signed in and it\'ll appear here.'); return; }
+      var html = '';
+      items.forEach(function(it){
+        html += '<div style="border:1px solid var(--border,#eee);border-radius:14px;padding:13px 16px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">'
+          + '<div style="min-width:0;flex:1">'
+          +   '<div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(it.filename||'Transcript')+'</div>'
+          +   '<div style="font-size:12px;color:var(--ink2,#777);margin-top:3px">'+fmtDate(it.created_at)+' &middot; '+(it.word_count||0)+' words'+(it.language?(' &middot; '+esc(it.language)):'')+'</div>'
+          + '</div>'
+          + '<button onclick="window.viewMyTranscript(\''+it.id+'\')" style="border:2px solid var(--accent);background:#fff;border-radius:100px;padding:6px 16px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:var(--ink);flex-shrink:0">View</button>'
+          + '</div>';
+      });
+      body.innerHTML = html;
+    } catch(e){ body.innerHTML = msg('Could not load your transcripts. Please try again.', '#c0392b'); }
+  };
+
+  window.viewMyTranscript = async function(id){
+    var body = document.getElementById('mytx-body'); if (!body) return;
+    body.innerHTML = msg('Loading…');
+    var t = await tok();
+    if (!t){ body.innerHTML = msg('Please sign in again.'); return; }
+    try {
+      var res = await fetch('/api/transcribe/mine/'+encodeURIComponent(id), { headers: { 'Authorization':'Bearer '+t, 'X-Requested-With':'fetch' } });
+      var d = await res.json();
+      if (!res.ok) throw new Error(d.error || 'Failed');
+      var it = d.item || {};
+      var txt = it.transcript || '';
+      var dlName = (it.filename || 'transcript').replace(/\.[^.]+$/, '') + '.txt';
+      body.innerHTML =
+        '<button onclick="window.openMyTranscripts()" style="background:none;border:none;cursor:pointer;color:var(--accent);font-weight:600;font-size:13px;padding:0 0 12px;font-family:inherit">&larr; Back to list</button>'
+        + '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px">'
+        +   '<div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:55%">'+esc(it.filename||'Transcript')+'</div>'
+        +   '<div style="display:flex;gap:6px">'
+        +     '<button id="mytx-copy" style="border:2px solid rgba(26,24,20,.12);background:#fff;border-radius:100px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:var(--ink)">Copy</button>'
+        +     '<button id="mytx-dl" style="border:2px solid var(--accent);background:#fff;border-radius:100px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:var(--ink)">.txt</button>'
+        +   '</div>'
+        + '</div>'
+        + (it.summary ? ('<div style="background:var(--cream,#faf8f3);border-radius:12px;padding:12px 14px;font-size:13px;color:var(--ink2,#555);margin-bottom:12px"><strong>Summary:</strong> '+esc(it.summary)+'</div>') : '')
+        + '<div style="white-space:pre-wrap;font-size:14px;line-height:1.6;max-height:46vh;overflow-y:auto;border:1px solid var(--border,#eee);border-radius:12px;padding:14px">'+esc(txt)+'</div>';
+      var dlBtn = document.getElementById('mytx-dl'); if (dlBtn) dlBtn.onclick = function(){ dl(dlName, txt); };
+      var cpBtn = document.getElementById('mytx-copy'); if (cpBtn) cpBtn.onclick = function(){ try { navigator.clipboard.writeText(txt); } catch(e){} var b=this; var o=b.textContent; b.textContent='Copied!'; setTimeout(function(){ b.textContent=o; }, 1200); };
+    } catch(e){ body.innerHTML = msg('Could not open that transcript.', '#c0392b'); }
+  };
+
+  window.closeMyTranscripts = function(){
+    var ov = document.getElementById('mytx-overlay'); if (ov) ov.style.display = 'none';
+    document.body.style.overflow = '';
+  };
 })();
 </script>
 </body>
