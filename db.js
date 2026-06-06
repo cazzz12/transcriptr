@@ -87,9 +87,35 @@ export async function isUserBanned(ip) {
   const { data } = await sb().from('users').select('banned').eq('ip', (ip||'').replace('::ffff:','')).maybeSingle();
   return data?.banned||false;
 }
-export async function saveTranscription({ ip, filename, transcript, language, duration, wordCount, summary }) {
-  const { data } = await sb().from('transcriptions').insert({ ip:(ip||'').replace('::ffff:',''), filename, transcript, summary:summary||null, language:language||null, duration_seconds:Math.round(duration||0), word_count:wordCount||0, created_at:new Date().toISOString() }).select().single();
+export async function saveTranscription({ ip, filename, transcript, language, duration, wordCount, summary, userId }) {
+  const { data } = await sb().from('transcriptions').insert({ ip:(ip||'').replace('::ffff:',''), user_id: userId||null, filename, transcript, summary:summary||null, language:language||null, duration_seconds:Math.round(duration||0), word_count:wordCount||0, created_at:new Date().toISOString() }).select().single();
   return data;
+}
+
+// ===== End-user accounts (Supabase Auth) =====
+// Verify a Supabase access token (JWT) and return the signed-in user, or null.
+export async function getUserFromToken(token) {
+  if (!token) return null;
+  try {
+    const { data, error } = await sb().auth.getUser(token);
+    if (error) return null;
+    return data?.user || null;
+  } catch (e) { return null; }
+}
+// List a signed-in user's own transcripts (lightweight: no full transcript text).
+export async function getUserTranscriptions(userId, { limit = 100 } = {}) {
+  if (!userId) return [];
+  const { data } = await sb().from('transcriptions')
+    .select('id,filename,language,duration_seconds,word_count,summary,created_at')
+    .eq('user_id', userId).order('created_at', { ascending: false }).limit(limit);
+  return data || [];
+}
+// Fetch ONE transcript (full text) that belongs to this user. Returns null if it isn't theirs.
+export async function getUserTranscriptById(userId, id) {
+  if (!userId) return null;
+  const { data } = await sb().from('transcriptions').select('*')
+    .eq('id', id).eq('user_id', userId).maybeSingle();
+  return data || null;
 }
 export async function getTranscriptions({ limit=50, offset=0, search='' }={}) {
   let q = sb().from('transcriptions').select('id,ip,filename,language,duration_seconds,word_count,summary,created_at',{count:'exact'}).order('created_at',{ascending:false}).range(offset,offset+limit-1);
