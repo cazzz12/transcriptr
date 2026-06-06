@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
-import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings } from '../db.js';
+import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings, getUserFromToken, getUserTranscriptions, getUserTranscriptById } from '../db.js';
 import { apiRateLimit, convertLogRateLimit } from '../middleware/security.js';
 
 const router = express.Router();
@@ -74,6 +74,14 @@ router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
 
     const { timestamps, speakers, summary, language } = req.body;
     const fixedName = fixFilename(req.file.originalname, req.file.mimetype);
+
+    // End-user account (optional): if a signed-in user's token is sent, tag this transcript to them.
+    let userId = null;
+    try {
+      const authHeader = req.headers.authorization || '';
+      const tok = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+      if (tok) { const u = await getUserFromToken(tok); userId = u?.id || null; }
+    } catch (e) {}
 
     await logActivity('transcription_started', ip, { filename: fixedName, size: req.file.size });
 
@@ -148,7 +156,7 @@ router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
     }
 
     const wordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
-    await saveTranscription({ ip, filename: fixedName, transcript: transcript.trim(), summary: summaryText, language: data.language, duration: data.duration, wordCount });
+    await saveTranscription({ ip, filename: fixedName, transcript: transcript.trim(), summary: summaryText, language: data.language, duration: data.duration, wordCount, userId });
     await updateStats('transcribe', { duration: data.duration, language: data.language });
     await upsertUser(ip, 'transcribe', { duration: data.duration });
     await logActivity('transcription_complete', ip, { filename: fixedName, duration: data.duration, language: data.language, words: wordCount });
@@ -173,6 +181,41 @@ router.post('/convert-log', convertLogRateLimit, async (req, res) => {
     size: typeof size === 'number' ? size : 0
   });
   res.json({ success: true });
+});
+
+// ===== End-user account: "My Transcripts" =====
+async function requireUser(req, res) {
+  const authHeader = req.headers.authorization || '';
+  const tok = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (!tok) { res.status(401).json({ error: 'Please sign in.' }); return null; }
+  const user = await getUserFromToken(tok);
+  if (!user) { res.status(401).json({ error: 'Your session expired. Please sign in again.' }); return null; }
+  return user;
+}
+
+// List my transcripts (newest first)
+router.get('/mine', async (req, res) => {
+  try {
+    const user = await requireUser(req, res);
+    if (!user) return;
+    const items = await getUserTranscriptions(user.id, { limit: 100 });
+    res.json({ items });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not load your transcripts.' });
+  }
+});
+
+// Get one of my transcripts, with the full text
+router.get('/mine/:id', async (req, res) => {
+  try {
+    const user = await requireUser(req, res);
+    if (!user) return;
+    const item = await getUserTranscriptById(user.id, req.params.id);
+    if (!item) return res.status(404).json({ error: 'Transcript not found.' });
+    res.json({ item });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not load that transcript.' });
+  }
 });
 
 export default router;
