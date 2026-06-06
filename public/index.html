@@ -990,6 +990,8 @@ footer {
 @media(max-width:860px){ .nav-logo-img { height: 28px; } }
 @media(max-width:400px){ .nav-logo-img { height: 25px; } }
 </style>
+  <!-- Supabase JS (end-user Google sign-in) -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
 
@@ -1028,6 +1030,17 @@ footer {
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
       <span data-i18n="nav_downloader">YT Downloader</span>
     </a>
+    <!-- Google sign-in (end users) -->
+    <div id="auth-area" style="display:flex;align-items:center;gap:10px">
+      <button id="signin-btn" onclick="window.signInWithGoogle()" style="display:flex;align-items:center;gap:8px;background:#fff;border:2px solid var(--accent);border-radius:100px;padding:7px 16px 7px 12px;cursor:pointer;font-family:'Satoshi',sans-serif;font-size:13px;font-weight:600;color:var(--ink);box-shadow:0 0 0 1px rgba(32,115,253,.12)">
+        <svg width="16" height="16" viewBox="0 0 48 48" style="flex-shrink:0"><path fill="#FFC107" d="M43.611 20.083H42V20H24v8h11.303c-1.649 4.657-6.08 8-11.303 8-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.65-.389-3.917z"/><path fill="#FF3D00" d="M6.306 14.691l6.571 4.819C14.655 15.108 18.961 12 24 12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 16.318 4 9.656 8.337 6.306 14.691z"/><path fill="#4CAF50" d="M24 44c5.166 0 9.86-1.977 13.409-5.192l-6.19-5.238C29.211 35.091 26.715 36 24 36c-5.202 0-9.619-3.317-11.283-7.946l-6.522 5.025C9.505 39.556 16.227 44 24 44z"/><path fill="#1976D2" d="M43.611 20.083H42V20H24v8h11.303c-.792 2.237-2.231 4.166-4.087 5.571.001-.001.002-.001.003-.002l6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z"/></svg>
+        <span>Sign in</span>
+      </button>
+      <div id="user-chip" style="display:none;align-items:center;gap:10px">
+        <span id="user-email" style="font-size:13px;font-weight:600;color:var(--ink);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+        <button onclick="window.signOutUser()" style="background:none;border:2px solid rgba(26,24,20,.12);border-radius:100px;padding:6px 14px;cursor:pointer;font-family:'Satoshi',sans-serif;font-size:12px;font-weight:600;color:var(--ink)">Sign out</button>
+      </div>
+    </div>
     <a href="javascript:void(0)" onclick="showSection('app')" class="nav-cta" data-i18n="nav_cta">Start transcribing →</a>
   </div>
 </nav>
@@ -2585,5 +2598,48 @@ function audioBufferToWav(buffer) {
     <button class="cookie-accept" onclick="window.acceptCookies()">Accept</button>
   </div>
 </div>
+<script>
+/* End-user Google sign-in via Supabase Auth (separate from admin login) */
+(function(){
+  var SUPABASE_URL = 'https://pbjgljsuduxtcmnbzdki.supabase.co';
+  var SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBiamdsanN1ZHV4dGNtbmJ6ZGtpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3MTQ0MjIsImV4cCI6MjA5MjI5MDQyMn0.S2yd080BgVYvx4M-8WBF453BbuduHy-pfpq4rZz-BKM';
+  if (!window.supabase || !window.supabase.createClient) { console.warn('Supabase JS failed to load'); return; }
+  var sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  window._sb = sb;
+
+  function updateAuthUI(session){
+    var signinBtn = document.getElementById('signin-btn');
+    var chip = document.getElementById('user-chip');
+    var emailEl = document.getElementById('user-email');
+    if (!signinBtn || !chip) return;
+    if (session && session.user){
+      signinBtn.style.display = 'none';
+      chip.style.display = 'flex';
+      if (emailEl){
+        var u = session.user;
+        emailEl.textContent = u.email || (u.user_metadata && u.user_metadata.full_name) || 'Account';
+      }
+    } else {
+      signinBtn.style.display = 'flex';
+      chip.style.display = 'none';
+    }
+  }
+
+  window.signInWithGoogle = function(){
+    sb.auth.signInWithOAuth({ provider:'google', options:{ redirectTo: window.location.origin } });
+  };
+  window.signOutUser = function(){
+    sb.auth.signOut().then(function(){ updateAuthUI(null); });
+  };
+
+  sb.auth.getSession().then(function(res){
+    updateAuthUI(res && res.data ? res.data.session : null);
+  }).catch(function(){ updateAuthUI(null); });
+
+  sb.auth.onAuthStateChange(function(_event, session){
+    updateAuthUI(session);
+  });
+})();
+</script>
 </body>
 </html>
