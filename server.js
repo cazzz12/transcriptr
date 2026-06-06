@@ -60,7 +60,7 @@ app.use((req, res, next) => {
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; " +
-    "script-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://www.googletagmanager.com https://www.googleadservices.com https://www.google-analytics.com; " +
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com https://www.googletagmanager.com https://www.googleadservices.com https://www.google-analytics.com; " +
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; " +
     "font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; " +
     "img-src 'self' data: blob: https://img.youtube.com https://www.googletagmanager.com https://www.google-analytics.com https://*.google-analytics.com https://www.google.com https://googleads.g.doubleclick.net https://*.g.doubleclick.net; " +
