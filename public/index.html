@@ -1664,6 +1664,14 @@ window.loadUrl = function() {
 window.toggleChip = function(id) { document.getElementById(id).classList.toggle('on'); }
 function clearErr() { document.getElementById('err-box').classList.remove('show'); }
 function showErr(msg) { const el=document.getElementById('err-box'); el.textContent='⚠ '+msg; el.classList.add('show'); }
+function showSigninPrompt(msg) {
+  var el = document.getElementById('err-box'); el.innerHTML = '';
+  var t = document.createElement('div'); t.textContent = '⚠ ' + (msg || 'Please sign in to continue.'); t.style.marginBottom = '10px';
+  var btn = document.createElement('button'); btn.textContent = 'Sign in with Google';
+  btn.style.cssText = 'display:inline-flex;align-items:center;gap:8px;background:#fff;border:2px solid var(--accent);border-radius:100px;padding:8px 18px;cursor:pointer;font-family:inherit;font-size:14px;font-weight:600;color:var(--ink)';
+  btn.onclick = function(){ if (window.signInWithGoogle) window.signInWithGoogle(); };
+  el.appendChild(t); el.appendChild(btn); el.classList.add('show');
+}
 
 function setSteps(states) {
   ['ps-upload','ps-decode','ps-transcribe','ps-format','ps-done'].forEach((id,i) => {
@@ -1796,7 +1804,7 @@ window.runTranscription = async function() {
       setProg(40, 'Transcribing with Whisper AI...'); setSteps(['done','done','active','','']);
       var authH = (window.getAuthHeader ? await window.getAuthHeader() : {});
       var sRes = await fetch('/api/transcribe', { method: 'POST', headers: Object.assign({ 'X-Requested-With': 'fetch' }, authH), body: fd2 });
-      if (!sRes.ok) { var se = await sRes.json().catch(()=>({})); if (sRes.status===429) throw new Error('Daily limit reached.'); throw new Error(se.error || 'Transcription failed.'); }
+      if (!sRes.ok) { var se = await sRes.json().catch(()=>({})); var e429 = new Error(se.error || (sRes.status===429 ? 'Daily limit reached.' : 'Transcription failed.')); if (sRes.status===429 && se.needsAuth) e429.needsAuth = true; throw e429; }
       data = await sRes.json();
     }
     setSteps(['done','done','done','active','']);
@@ -1813,6 +1821,8 @@ window.runTranscription = async function() {
     // to the reliable path: download the MP3, then upload it.
     if (isYouTube && !currentFile) {
       window.showYouTubeFallback(urlVal);
+    } else if (err && err.needsAuth) {
+      showSigninPrompt(err.message);
     } else {
       showErr(err.message || 'Transcription failed. Please try again.');
     }
