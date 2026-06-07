@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
-import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings, getUserFromToken, getUserTranscriptions, getUserTranscriptById } from '../db.js';
+import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings, getUserFromToken, getUserTranscriptions, getUserTranscriptById, countTodayTranscriptions } from '../db.js';
 import { apiRateLimit, convertLogRateLimit } from '../middleware/security.js';
 
 const router = express.Router();
@@ -32,24 +32,8 @@ function fixFilename(originalname, mimetype) {
   return name;
 }
 
-// FIX #11: Server-side daily limit
-const dailyUsage = new Map();
-// Clean up at midnight
-setInterval(() => {
-  const today = new Date().toISOString().split('T')[0];
-  for (const [key] of dailyUsage) {
-    if (!key.endsWith(today)) dailyUsage.delete(key);
-  }
-}, 60 * 60 * 1000);
-
-function checkServerDailyLimit(ip) {
-  const today = new Date().toISOString().split('T')[0];
-  const key = `${ip}:${today}`;
-  const count = dailyUsage.get(key) || 0;
-  if (count >= 3) return false;
-  dailyUsage.set(key, count + 1);
-  return true;
-}
+// FIX #11: Daily limit is now counted in the database (see countTodayTranscriptions in db.js),
+// so it's reliable on Vercel's serverless setup instead of an in-memory map that resets.
 
 router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
   const ip = (req.ip || '').replace('::ffff:', '');
@@ -63,9 +47,23 @@ router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
     if (!apiKey) return res.status(503).json({ error: 'Service temporarily unavailable.' });
     if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
-    // FIX #5: Server-side daily limit enforcement
-    if (!checkServerDailyLimit(ip)) {
-      return res.status(429).json({ error: 'Daily free limit reached (3/day). Come back tomorrow or upgrade to Pro.' });
+    // Identify the user first (if signed in) — needed for the daily limit below.
+    let userId = null;
+    try {
+      const authHeader = req.headers.authorization || '';
+      const tok = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+      if (tok) { const u = await getUserFromToken(tok); userId = u?.id || null; }
+    } catch (e) {}
+
+    // Daily free limit: 1/day for anonymous (must sign in for more), 3/day for signed-in free accounts.
+    const FREE_ANON_DAILY = 1;
+    const FREE_USER_DAILY = 3;
+    const usedToday = await countTodayTranscriptions({ userId, ip });
+    if (!userId && usedToday >= FREE_ANON_DAILY) {
+      return res.status(429).json({ error: "You've used your free transcript for today. Sign in with Google to get 3 per day, free.", needsAuth: true });
+    }
+    if (userId && usedToday >= FREE_USER_DAILY) {
+      return res.status(429).json({ error: "You've reached your 3 free transcripts for today. Please come back tomorrow." });
     }
 
     const settings = await getSettings();
@@ -74,14 +72,6 @@ router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
 
     const { timestamps, speakers, summary, language } = req.body;
     const fixedName = fixFilename(req.file.originalname, req.file.mimetype);
-
-    // End-user account (optional): if a signed-in user's token is sent, tag this transcript to them.
-    let userId = null;
-    try {
-      const authHeader = req.headers.authorization || '';
-      const tok = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-      if (tok) { const u = await getUserFromToken(tok); userId = u?.id || null; }
-    } catch (e) {}
 
     await logActivity('transcription_started', ip, { filename: fixedName, size: req.file.size });
 
