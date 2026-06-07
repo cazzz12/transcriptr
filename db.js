@@ -102,6 +102,15 @@ export async function getUserFromToken(token) {
     return data?.user || null;
   } catch (e) { return null; }
 }
+// Count how many transcripts this identity has made since midnight UTC today (DB-backed daily limit).
+export async function countTodayTranscriptions({ userId, ip }) {
+  const start = new Date(); start.setUTCHours(0, 0, 0, 0);
+  let q = sb().from('transcriptions').select('*', { count: 'exact', head: true }).gte('created_at', start.toISOString());
+  if (userId) { q = q.eq('user_id', userId); }
+  else { q = q.is('user_id', null).eq('ip', (ip || '').replace('::ffff:', '')); }
+  const { count } = await q;
+  return count || 0;
+}
 // List a signed-in user's own transcripts (lightweight: no full transcript text).
 export async function getUserTranscriptions(userId, { limit = 100 } = {}) {
   if (!userId) return [];
