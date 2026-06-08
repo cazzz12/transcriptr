@@ -2363,22 +2363,24 @@ window.ytDlFetch = function() {
   })
   .finally(function(){
     if (btn) { btn.textContent='Get links'; btn.disabled=false; }
-    // Each format button opens our stream endpoint, which redirects the browser
-    // straight to the download. We first do a quick check that links exist.
+    // Each format button downloads via ytDownloadFile, which forces a real
+    // save instead of letting the browser play the file inline in a new tab.
     var streamBase = '/api/youtube/stream/' + id;
+    var ttlEl = document.getElementById('yt-dl-title');
+    var baseName = (ttlEl && ttlEl.textContent ? ttlEl.textContent : 'video')
+      .replace(/[^\w\s.-]/g, '').replace(/\s+/g, '_').slice(0, 80) || 'video';
     var fmtMap = {
-      'yt-dl-mp4-hd': streamBase + '?format=mp4',
-      'yt-dl-mp3':    streamBase + '?format=mp3',
-      'yt-dl-mp4-sd': streamBase + '?format=mp4-sd',
-      'yt-dl-m4a':    streamBase + '?format=m4a'
+      'yt-dl-mp4-hd': { url: streamBase + '?format=mp4',    name: baseName + '.mp4' },
+      'yt-dl-mp3':    { url: streamBase + '?format=mp3',    name: baseName + '.mp3' },
+      'yt-dl-mp4-sd': { url: streamBase + '?format=mp4-sd', name: baseName + '_SD.mp4' },
+      'yt-dl-m4a':    { url: streamBase + '?format=m4a',    name: baseName + '.m4a' }
     };
     Object.keys(fmtMap).forEach(function(elId){
       var el = document.getElementById(elId);
       if (!el) return;
       el.href = 'javascript:void(0)';
       el.onclick = function(){
-        // Open the download in a new tab — the server redirects to the file
-        window.open(fmtMap[elId], '_blank');
+        window.ytDownloadFile(fmtMap[elId].url, fmtMap[elId].name, el);
         return false;
       };
     });
@@ -2397,7 +2399,7 @@ window.ytDownloadFile = function(url, fallbackName, btnEl){
   if (origText) origText.textContent = 'Preparing...';
   if (errEl) errEl.classList.remove('show');
 
-  fetch(url, { headers: { 'X-Requested-With': 'fetch' } })
+  fetch(url)
     .then(function(r){
       var ct = r.headers.get('content-type') || '';
       // If server responded with JSON, it's an error — read and show it
@@ -2422,8 +2424,15 @@ window.ytDownloadFile = function(url, fallbackName, btnEl){
     })
     .catch(function(e){
       if (origText) origText.textContent = origLabel;
+      var msg = (e && e.message) || '';
+      // A network/CORS failure means we couldn't read the cross-origin file as
+      // a blob — fall back to opening it so the browser still handles it.
+      if ((e instanceof TypeError) || /failed to fetch|networkerror|load failed/i.test(msg)) {
+        window.open(url, '_blank');
+        return;
+      }
       if (errEl) {
-        errEl.textContent = e.message;
+        errEl.textContent = msg || 'Download failed.';
         errEl.classList.add('show');
       }
     });
