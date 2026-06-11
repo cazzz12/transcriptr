@@ -72,11 +72,12 @@ router.post('/upload-url', apiRateLimit, async (req, res) => {
 // ===== GPU transcription via RunPod serverless Whisper (no file-size cap) =====
 const RUNPOD_BASE = 'https://api.runpod.ai/v2';
 
-async function runpodFetch(path, opts = {}) {
+async function runpodFetch(path, opts = {}, endpointId = null) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), 20000);
   try {
-    return await fetch(`${RUNPOD_BASE}/${process.env.RUNPOD_ENDPOINT_ID}${path}`, {
+    const ep = endpointId || process.env.RUNPOD_ENDPOINT_ID;
+    return await fetch(`${RUNPOD_BASE}/${ep}${path}`, {
       ...opts,
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RUNPOD_API_KEY}`, ...(opts.headers || {}) },
       signal: ac.signal
@@ -138,10 +139,16 @@ router.post('/start', apiRateLimit, async (req, res) => {
     if (!/^[A-Za-z0-9._-]{6,80}$/.test(sp)) return res.status(400).json({ error: 'Invalid upload reference.' });
     const originalName = (req.body?.originalName ? String(req.body.originalName) : 'audio').slice(0, 200);
     const language = req.body?.language && req.body.language !== 'auto' ? String(req.body.language).slice(0, 10) : null;
+    // Speaker recognition runs on a second endpoint with voice analysis (pyannote).
+    // If that endpoint isn't configured, fall back gracefully to plain transcription.
+    const wantSpeakers = req.body?.speakers === 'true' || req.body?.speakers === true;
+    const diarizeEp = process.env.RUNPOD_DIARIZE_ENDPOINT_ID || '';
+    const useDiarize = wantSpeakers && !!diarizeEp;
     const opts = {
       timestamps: req.body?.timestamps === 'true' || req.body?.timestamps === true,
       summary: req.body?.summary === 'true' || req.body?.summary === true,
-      translateEn: req.body?.translateEn === 'true' || req.body?.translateEn === true
+      translateEn: req.body?.translateEn === 'true' || req.body?.translateEn === true,
+      speakers: useDiarize
     };
 
     // Signed 6-hour link the GPU uses to fetch the file from the private bucket.
@@ -151,10 +158,12 @@ router.post('/start', apiRateLimit, async (req, res) => {
 
     const input = {
       audio: audioUrl,
-      model: process.env.RUNPOD_WHISPER_MODEL || 'turbo',
+      // The diarization worker only ships large-v3 (no turbo) — worth it for real speakers.
+      model: useDiarize ? (process.env.RUNPOD_DIARIZE_MODEL || 'large-v3') : (process.env.RUNPOD_WHISPER_MODEL || 'turbo'),
       transcription: 'plain_text',
       translate: !!opts.translateEn
     };
+    if (useDiarize) input.diarize = true;
     // Translated output is requested as SRT so the English text keeps real timings.
     if (opts.translateEn) input.translation = 'srt';
     if (language) input.language = language;
@@ -163,7 +172,7 @@ router.post('/start', apiRateLimit, async (req, res) => {
     // transcript completes and saves even if the visitor closes the page.
     const base = process.env.PUBLIC_BASE_URL || 'https://transcriptr.nl';
     const webhook = `${base}/api/transcribe/hook?sp=${encodeURIComponent(sp)}&sig=${hookSig(sp)}`;
-    const rp = await runpodFetch('/run', { method: 'POST', body: JSON.stringify({ input, webhook }) });
+    const rp = await runpodFetch('/run', { method: 'POST', body: JSON.stringify({ input, webhook }) }, useDiarize ? diarizeEp : null);
     if (!rp.ok) {
       await logActivity('transcription_error', ip, { stage: 'runpod_start', status: rp.status });
       return res.status(502).json({ error: 'Could not start transcription. Please try again.' });
@@ -201,12 +210,40 @@ async function finalizeCompletedJob(job, out, ip) {
     })).filter(sgm => sgm.text);
   }
 
+  // Real speaker labels: the diarization pass tells us WHO spoke WHEN (by voice).
+  // Attach each text segment to the speaker whose turn overlaps it the most.
+  const dia = (out.diarization && Array.isArray(out.diarization.segments)) ? out.diarization.segments : [];
+  if (jopts.speakers && dia.length && segs.length) {
+    segs = segs.map(sg => {
+      let best = -1, bestOv = 0;
+      for (const d of dia) {
+        const ov = Math.min(sg.end, Number(d.end) || 0) - Math.max(sg.start, Number(d.start) || 0);
+        if (ov > bestOv) { bestOv = ov; best = Number(d.speaker); }
+      }
+      return (best >= 0) ? Object.assign({}, sg, { speaker: best + 1 }) : sg;
+    });
+  }
+  const hasSpeakers = segs.some(sg => sg.speaker);
+
   let transcript = '';
   if (jopts.timestamps && segs.length) {
     segs.forEach((seg) => {
       const mm = String(Math.floor((seg.start || 0) / 60)).padStart(2, '0');
       const ss = String(Math.floor((seg.start || 0) % 60)).padStart(2, '0');
-      transcript += `[${mm}:${ss}] ${seg.text}\n\n`;
+      const spk = seg.speaker ? `Speaker ${seg.speaker}: ` : '';
+      transcript += `[${mm}:${ss}] ${spk}${seg.text}\n\n`;
+    });
+  } else if (hasSpeakers) {
+    // Group consecutive lines from the same voice into one paragraph per turn.
+    let lastSpk = null;
+    segs.forEach((seg) => {
+      if (seg.speaker !== lastSpk) {
+        transcript += (transcript ? '\n\n' : '') + (seg.speaker ? `Speaker ${seg.speaker}: ` : '');
+        lastSpk = seg.speaker;
+        transcript += seg.text;
+      } else {
+        transcript += ' ' + seg.text;
+      }
     });
   } else {
     transcript = usedTranslation
@@ -276,7 +313,8 @@ router.get('/status/:jobId', async (req, res) => {
     }
     if (job.status === 'failed') return res.status(502).json({ status: 'failed', error: 'Transcription failed. Please try again.' });
 
-    const rp = await runpodFetch(`/status/${jobId}`, { method: 'GET' });
+    const jobEp = (job.options && job.options.speakers) ? (process.env.RUNPOD_DIARIZE_ENDPOINT_ID || null) : null;
+    const rp = await runpodFetch(`/status/${jobId}`, { method: 'GET' }, jobEp);
     if (!rp.ok) {
       if (rp.status === 404) {
         await markJob(jobId, { status: 'failed', error: 'expired' });
@@ -331,7 +369,8 @@ router.post('/hook', async (req, res) => {
     const job = await getJobByStoragePath(sp);
     if (!job || job.status !== 'running') return res.json({ ok: true }); // already handled elsewhere
 
-    const rp = await runpodFetch(`/status/${job.id}`, { method: 'GET' });
+    const hookEp = (job.options && job.options.speakers) ? (process.env.RUNPOD_DIARIZE_ENDPOINT_ID || null) : null;
+    const rp = await runpodFetch(`/status/${job.id}`, { method: 'GET' }, hookEp);
     if (!rp.ok) return res.status(502).json({ ok: false }); // RunPod retries on non-2xx
     const rj = await rp.json().catch(() => ({}));
 
