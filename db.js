@@ -10,6 +10,63 @@ function sb() {
   return _sb;
 }
 
+// ───── Storage helpers: let the browser upload files directly to Supabase,
+// bypassing Vercel's 4.5MB request limit. All access is via the service key. ─────
+const UPLOAD_BUCKET = 'transcribe-uploads';
+
+// Create a one-time signed URL the browser can upload a single file to.
+export async function createUploadUrl() {
+  const path = `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+  const { data, error } = await sb().storage.from(UPLOAD_BUCKET).createSignedUploadUrl(path);
+  if (error) throw error;
+  return { path, token: data.token };
+}
+
+// Pull an uploaded file back out of storage as a Buffer (to forward to Whisper).
+export async function downloadFromStorage(path) {
+  const { data, error } = await sb().storage.from(UPLOAD_BUCKET).download(path);
+  if (error) throw error;
+  return Buffer.from(await data.arrayBuffer());
+}
+
+// Delete an uploaded file once we're finished with it.
+export async function removeFromStorage(path) {
+  try { await sb().storage.from(UPLOAD_BUCKET).remove([path]); } catch (e) {}
+}
+
+// Signed, expiring download URL so the RunPod GPU can fetch a file from the private bucket.
+export async function createSignedDownloadUrl(path, expiresInSeconds = 21600) {
+  const { data, error } = await sb().storage.from(UPLOAD_BUCKET).createSignedUrl(path, expiresInSeconds);
+  if (error) throw error;
+  return data.signedUrl;
+}
+
+// ===== GPU transcription jobs (RunPod) =====
+export async function createJob({ id, ip, userId, filename, storagePath, options }) {
+  await sb().from('transcribe_jobs').insert({
+    id, ip: (ip || '').replace('::ffff:', ''), user_id: userId || null,
+    filename: filename || null, storage_path: storagePath, options: options || {}, status: 'running'
+  });
+}
+export async function getJob(id) {
+  const { data } = await sb().from('transcribe_jobs').select('*').eq('id', id).maybeSingle();
+  return data || null;
+}
+export async function markJob(id, fields) {
+  try { await sb().from('transcribe_jobs').update(fields).eq('id', id); } catch (e) {}
+}
+// Jobs still running today — counted toward the daily limit so it can't be bypassed
+// by starting several jobs before the first one finishes.
+export async function countTodayRunningJobs({ userId, ip }) {
+  const start = new Date(); start.setUTCHours(0, 0, 0, 0);
+  let q = sb().from('transcribe_jobs').select('*', { count: 'exact', head: true })
+    .eq('status', 'running').gte('created_at', start.toISOString());
+  if (userId) { q = q.eq('user_id', userId); }
+  else { q = q.is('user_id', null).eq('ip', (ip || '').replace('::ffff:', '')); }
+  const { count } = await q;
+  return count || 0;
+}
+
 export async function getAdmin() {
   const { data } = await sb().from('admin').select('*').eq('id', 1).single();
   return data;
