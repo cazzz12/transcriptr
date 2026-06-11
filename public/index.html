@@ -1,11 +1,33 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=AW-18217176090"></script>
+  <!-- Google Consent Mode v2: deny everything until the visitor chooses.
+       This MUST run before the gtag.js loader below. -->
 <script>
   window.dataLayer = window.dataLayer || [];
   function gtag(){dataLayer.push(arguments);}
+  gtag('consent', 'default', {
+    'ad_storage': 'denied',
+    'ad_user_data': 'denied',
+    'ad_personalization': 'denied',
+    'analytics_storage': 'denied',
+    'wait_for_update': 500
+  });
+  // Returning visitors: re-apply their saved choice straight away.
+  try {
+    if (localStorage.getItem('cookies') === 'accepted') {
+      gtag('consent', 'update', {
+        'ad_storage': 'granted',
+        'ad_user_data': 'granted',
+        'ad_personalization': 'granted',
+        'analytics_storage': 'granted'
+      });
+    }
+  } catch(e) {}
+</script>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=AW-18217176090"></script>
+<script>
   gtag('js', new Date());
   gtag('config', 'AW-18217176090');
 </script>
@@ -2320,8 +2342,8 @@ function getDailyCount(){try{var s=JSON.parse(localStorage.getItem('daily_usage'
 function checkDailyLimit(){var b=document.getElementById('limit-banner'),btn=document.getElementById('go-btn');if(getDailyCount()>=3){if(b)b.classList.add('show');if(btn)btn.disabled=true;return true;}if(b)b.classList.remove('show');return false;}
 
 // ═══ COOKIES ═══
-window.acceptCookies=function(){localStorage.setItem('cookies','accepted');var b=document.getElementById('cookie-banner');if(b)b.style.display='none';};
-window.declineCookies=function(){localStorage.setItem('cookies','declined');var b=document.getElementById('cookie-banner');if(b)b.style.display='none';};
+window.acceptCookies=function(){localStorage.setItem('cookies','accepted');try{gtag('consent','update',{'ad_storage':'granted','ad_user_data':'granted','ad_personalization':'granted','analytics_storage':'granted'});}catch(e){}var b=document.getElementById('cookie-banner');if(b)b.style.display='none';};
+window.declineCookies=function(){localStorage.setItem('cookies','declined');try{gtag('consent','update',{'ad_storage':'denied','ad_user_data':'denied','ad_personalization':'denied','analytics_storage':'denied'});}catch(e){}var b=document.getElementById('cookie-banner');if(b)b.style.display='none';};
 
 // ═══ CONTACT ═══
 window.submitContact=function(){
@@ -2745,7 +2767,10 @@ function audioBufferToWav(buffer) {
           +   '<div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(it.filename||'Transcript')+'</div>'
           +   '<div style="font-size:12px;color:var(--ink2,#777);margin-top:3px">'+fmtDate(it.created_at)+' &middot; '+(it.word_count||0)+' words'+(it.language?(' &middot; '+esc(it.language)):'')+'</div>'
           + '</div>'
-          + '<button onclick="window.viewMyTranscript(\''+it.id+'\')" style="border:2px solid var(--accent);background:#fff;border-radius:100px;padding:6px 16px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:var(--ink);flex-shrink:0">View</button>'
+          + '<div style="display:flex;gap:6px;flex-shrink:0">'
+          +   '<button onclick="window.viewMyTranscript(\''+it.id+'\')" style="border:2px solid var(--accent);background:#fff;border-radius:100px;padding:6px 16px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:var(--ink)">View</button>'
+          +   '<button onclick="window.deleteMyTranscript(\''+it.id+'\')" style="border:2px solid #e5b8b1;background:#fff;border-radius:100px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:#c0392b">Delete</button>'
+          + '</div>'
           + '</div>';
       });
       body.innerHTML = html;
@@ -2771,13 +2796,28 @@ function audioBufferToWav(buffer) {
         +   '<div style="display:flex;gap:6px">'
         +     '<button id="mytx-copy" style="border:2px solid rgba(26,24,20,.12);background:#fff;border-radius:100px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:var(--ink)">Copy</button>'
         +     '<button id="mytx-dl" style="border:2px solid var(--accent);background:#fff;border-radius:100px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:var(--ink)">.txt</button>'
+        +     '<button id="mytx-del" style="border:2px solid #e5b8b1;background:#fff;border-radius:100px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:#c0392b">Delete</button>'
         +   '</div>'
         + '</div>'
         + (it.summary ? ('<div style="background:var(--cream,#faf8f3);border-radius:12px;padding:12px 14px;font-size:13px;color:var(--ink2,#555);margin-bottom:12px"><strong>Summary:</strong> '+esc(it.summary)+'</div>') : '')
         + '<div style="white-space:pre-wrap;font-size:14px;line-height:1.6;max-height:46vh;overflow-y:auto;border:1px solid var(--border,#eee);border-radius:12px;padding:14px">'+esc(txt)+'</div>';
       var dlBtn = document.getElementById('mytx-dl'); if (dlBtn) dlBtn.onclick = function(){ dl(dlName, txt); };
       var cpBtn = document.getElementById('mytx-copy'); if (cpBtn) cpBtn.onclick = function(){ try { navigator.clipboard.writeText(txt); } catch(e){} var b=this; var o=b.textContent; b.textContent='Copied!'; setTimeout(function(){ b.textContent=o; }, 1200); };
+      var delBtn = document.getElementById('mytx-del'); if (delBtn) delBtn.onclick = function(){ window.deleteMyTranscript(it.id); };
     } catch(e){ body.innerHTML = msg('Could not open that transcript.', '#c0392b'); }
+  };
+
+  // Permanently delete one of the user's transcripts (with confirmation).
+  window.deleteMyTranscript = async function(id){
+    if (!confirm('Delete this transcript permanently? This cannot be undone.')) return;
+    var body = document.getElementById('mytx-body');
+    var t = await tok();
+    if (!t){ if (body) body.innerHTML = msg('Please sign in again.'); return; }
+    try {
+      var res = await fetch('/api/transcribe/mine/'+encodeURIComponent(id), { method: 'DELETE', headers: { 'Authorization':'Bearer '+t, 'X-Requested-With':'fetch' } });
+      if (!res.ok){ var d = await res.json().catch(function(){ return {}; }); throw new Error(d.error || 'Failed'); }
+      window.openMyTranscripts();
+    } catch(e){ if (body) body.innerHTML = msg('Could not delete that transcript. Please try again.', '#c0392b'); }
   };
 
   window.closeMyTranscripts = function(){
