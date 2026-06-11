@@ -183,6 +183,14 @@ export async function getUserTranscriptById(userId, id) {
     .eq('id', id).eq('user_id', userId).maybeSingle();
   return data || null;
 }
+// Delete ONE of the signed-in user's own transcripts (GDPR right to erasure).
+// Scoped to user_id so nobody can delete someone else's transcript.
+export async function deleteUserTranscript(userId, id) {
+  if (!userId) return false;
+  const { data } = await sb().from('transcriptions').delete()
+    .eq('id', id).eq('user_id', userId).select('id');
+  return !!(data && data.length);
+}
 export async function getTranscriptions({ limit=50, offset=0, search='' }={}) {
   let q = sb().from('transcriptions').select('id,ip,filename,language,duration_seconds,word_count,summary,created_at',{count:'exact'}).order('created_at',{ascending:false}).range(offset,offset+limit-1);
   if (search) q = q.ilike('filename', `%${search}%`);
