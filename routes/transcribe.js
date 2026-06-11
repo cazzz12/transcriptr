@@ -83,6 +83,22 @@ async function runpodFetch(path, opts = {}) {
   } finally { clearTimeout(t); }
 }
 
+// Parse an SRT string (from the GPU's translate pass) back into timed segments,
+// so "Translate to English" keeps real subtitle timings.
+function parseSrtToSegments(srt) {
+  const segs = [];
+  const blocks = String(srt || '').split(/\r?\n\r?\n+/);
+  for (const b of blocks) {
+    const m = b.match(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/);
+    if (!m) continue;
+    const start = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000;
+    const end = (+m[5]) * 3600 + (+m[6]) * 60 + (+m[7]) + (+m[8]) / 1000;
+    const text = b.slice(b.indexOf(m[0]) + m[0].length).replace(/^\s+/, '').replace(/\s*\n\s*/g, ' ').trim();
+    if (text) segs.push({ start: Math.round(start * 100) / 100, end: Math.round(end * 100) / 100, text });
+  }
+  return segs;
+}
+
 // Start a GPU transcription job for a file the browser already uploaded to Supabase Storage.
 router.post('/start', apiRateLimit, async (req, res) => {
   const ip = (req.ip || '').replace('::ffff:', '');
@@ -118,7 +134,8 @@ router.post('/start', apiRateLimit, async (req, res) => {
     const opts = {
       timestamps: req.body?.timestamps === 'true' || req.body?.timestamps === true,
       speakers: req.body?.speakers === 'true' || req.body?.speakers === true,
-      summary: req.body?.summary === 'true' || req.body?.summary === true
+      summary: req.body?.summary === 'true' || req.body?.summary === true,
+      translateEn: req.body?.translateEn === 'true' || req.body?.translateEn === true
     };
 
     // Signed 6-hour link the GPU uses to fetch the file from the private bucket.
@@ -130,8 +147,10 @@ router.post('/start', apiRateLimit, async (req, res) => {
       audio: audioUrl,
       model: process.env.RUNPOD_WHISPER_MODEL || 'large-v3',
       transcription: 'plain_text',
-      translate: false
+      translate: !!opts.translateEn
     };
+    // Translated output is requested as SRT so the English text keeps real timings.
+    if (opts.translateEn) input.translation = 'srt';
     if (language) input.language = language;
 
     const rp = await runpodFetch('/run', { method: 'POST', body: JSON.stringify({ input }) });
@@ -165,7 +184,7 @@ router.get('/status/:jobId', async (req, res) => {
     // Finished earlier (e.g. the page was refreshed) — return the saved result.
     if (job.status === 'done' && job.result_id) {
       const t = await getTranscriptionById(job.result_id);
-      if (t) return res.json({ status: 'done', transcript: t.transcript, summary: t.summary || '', language: t.language, duration: t.duration_seconds, wordCount: t.word_count });
+      if (t) return res.json({ status: 'done', transcript: t.transcript, summary: t.summary || '', language: t.language, duration: t.duration_seconds, wordCount: t.word_count, segments: t.segments || [] });
       return res.status(410).json({ error: 'This transcript is no longer available.' });
     }
     if (job.status === 'failed') return res.status(502).json({ status: 'failed', error: 'Transcription failed. Please try again.' });
@@ -188,23 +207,38 @@ router.get('/status/:jobId', async (req, res) => {
     if (st === 'COMPLETED') {
       const out = rj.output || {};
       const jopts = job.options || {};
-      const segments = Array.isArray(out.segments) ? out.segments : [];
+
+      // Build clean segments with REAL timings. For "Translate to English" jobs
+      // the English text arrives as SRT (to keep timings) — parse it back.
+      let segs = [];
+      const hasTranslation = !!(jopts.translateEn && typeof out.translation === 'string' && out.translation.trim());
+      if (hasTranslation) segs = parseSrtToSegments(out.translation);
+      const usedTranslation = hasTranslation && segs.length > 0;
+      if (!segs.length && Array.isArray(out.segments)) {
+        segs = out.segments.map(sgm => ({
+          start: Math.round((sgm.start || 0) * 100) / 100,
+          end: Math.round((sgm.end || 0) * 100) / 100,
+          text: String(sgm.text || '').trim()
+        })).filter(sgm => sgm.text);
+      }
 
       let transcript = '';
-      if (jopts.timestamps && segments.length) {
-        segments.forEach((seg, i) => {
+      if (jopts.timestamps && segs.length) {
+        segs.forEach((seg, i) => {
           const mm = String(Math.floor((seg.start || 0) / 60)).padStart(2, '0');
           const ss = String(Math.floor((seg.start || 0) % 60)).padStart(2, '0');
           const spk = jopts.speakers ? `Speaker ${String.fromCharCode(65 + (i % 2))}: ` : '';
-          transcript += `[${mm}:${ss}] ${spk}${String(seg.text || '').trim()}\n\n`;
+          transcript += `[${mm}:${ss}] ${spk}${seg.text}\n\n`;
         });
       } else {
-        const raw = (typeof out.transcription === 'string' && out.transcription)
-          ? out.transcription
-          : segments.map(s => String(s.text || '').trim()).join(' ');
+        const raw = usedTranslation
+          ? segs.map(sgm => sgm.text).join(' ')
+          : ((typeof out.transcription === 'string' && out.transcription)
+              ? out.transcription
+              : segs.map(sgm => sgm.text).join(' '));
         if (jopts.speakers) {
-          (raw.match(/[^.!?]+[.!?]+/g) || [raw]).forEach((s, i) => {
-            transcript += `Speaker ${String.fromCharCode(65 + (i % 2))}: ${s.trim()}\n\n`;
+          (raw.match(/[^.!?]+[.!?]+/g) || [raw]).forEach((sx, i) => {
+            transcript += `Speaker ${String.fromCharCode(65 + (i % 2))}: ${sx.trim()}\n\n`;
           });
         } else { transcript = raw; }
       }
@@ -216,8 +250,8 @@ router.get('/status/:jobId', async (req, res) => {
         return res.status(502).json({ status: 'failed', error: 'No speech could be detected in this file.' });
       }
 
-      const duration = segments.length ? Math.round(segments[segments.length - 1].end || 0) : 0;
-      const detectedLang = out.detected_language || null;
+      const duration = segs.length ? Math.round(segs[segs.length - 1].end || 0) : 0;
+      const detectedLang = usedTranslation ? 'en' : (out.detected_language || null);
 
       let summaryText = '';
       if (jopts.summary) {
@@ -241,14 +275,14 @@ router.get('/status/:jobId', async (req, res) => {
       }
 
       const wordCount = transcript.split(/\s+/).filter(Boolean).length;
-      const saved = await saveTranscription({ ip: job.ip || ip, filename: job.filename, transcript, summary: summaryText, language: detectedLang, duration, wordCount, userId: job.user_id });
+      const saved = await saveTranscription({ ip: job.ip || ip, filename: job.filename, transcript, summary: summaryText, language: detectedLang, duration, wordCount, userId: job.user_id, segments: segs.length ? segs : null });
       await markJob(jobId, { status: 'done', result_id: saved?.id || null });
       await updateStats('transcribe', { duration, language: detectedLang });
       await upsertUser(job.ip || ip, 'transcribe', { duration });
       await logActivity('transcription_complete', ip, { filename: job.filename, duration, language: detectedLang, words: wordCount, engine: 'runpod' });
       await removeFromStorage(job.storage_path);
 
-      return res.json({ status: 'done', transcript, summary: summaryText, language: detectedLang, duration, wordCount });
+      return res.json({ status: 'done', transcript, summary: summaryText, language: detectedLang, duration, wordCount, segments: segs });
     }
 
     // FAILED / CANCELLED / TIMED_OUT
