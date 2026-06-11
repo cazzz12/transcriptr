@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
-import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings, getUserFromToken, getUserTranscriptions, getUserTranscriptById, countTodayTranscriptions } from '../db.js';
+import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings, getUserFromToken, getUserTranscriptions, getUserTranscriptById, countTodayTranscriptions, createUploadUrl, downloadFromStorage, removeFromStorage, createSignedDownloadUrl, createJob, getJob, markJob, countTodayRunningJobs, getTranscriptionById } from '../db.js';
 import { apiRateLimit, convertLogRateLimit } from '../middleware/security.js';
 
 const router = express.Router();
@@ -35,8 +35,236 @@ function fixFilename(originalname, mimetype) {
 // FIX #11: Daily limit is now counted in the database (see countTodayTranscriptions in db.js),
 // so it's reliable on Vercel's serverless setup instead of an in-memory map that resets.
 
+// Hand the browser a one-time URL to upload a file straight to Supabase Storage.
+// This bypasses Vercel's 4.5MB request-body limit. We check the daily limit here too,
+// so we don't hand out an upload slot to someone who's already out of transcripts.
+router.post('/upload-url', apiRateLimit, async (req, res) => {
+  const ip = (req.ip || '').replace('::ffff:', '');
+  try {
+    if (await isUserBanned(ip)) return res.status(403).json({ error: 'Your account has been suspended.' });
+    if (await isIPBlocked(ip)) return res.status(403).json({ error: 'Access denied.' });
+
+    let userId = null;
+    try {
+      const authHeader = req.headers.authorization || '';
+      const tok = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+      if (tok) { const u = await getUserFromToken(tok); userId = u?.id || null; }
+    } catch (e) {}
+
+    const FREE_ANON_DAILY = 1;
+    const FREE_USER_DAILY = 3;
+    const usedToday = await countTodayTranscriptions({ userId, ip });
+    if (!userId && usedToday >= FREE_ANON_DAILY) {
+      return res.status(429).json({ error: "You've used your free transcript for today. Sign in with Google to get 3 per day, free.", needsAuth: true });
+    }
+    if (userId && usedToday >= FREE_USER_DAILY) {
+      return res.status(429).json({ error: "You've reached your 3 free transcripts for today. Please come back tomorrow." });
+    }
+
+    const { path, token } = await createUploadUrl();
+    res.json({ bucket: 'transcribe-uploads', path, token });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not start upload. Please try again.' });
+  }
+});
+
+// ===== GPU transcription via RunPod serverless Whisper (no file-size cap) =====
+const RUNPOD_BASE = 'https://api.runpod.ai/v2';
+
+async function runpodFetch(path, opts = {}) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 20000);
+  try {
+    return await fetch(`${RUNPOD_BASE}/${process.env.RUNPOD_ENDPOINT_ID}${path}`, {
+      ...opts,
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.RUNPOD_API_KEY}`, ...(opts.headers || {}) },
+      signal: ac.signal
+    });
+  } finally { clearTimeout(t); }
+}
+
+// Start a GPU transcription job for a file the browser already uploaded to Supabase Storage.
+router.post('/start', apiRateLimit, async (req, res) => {
+  const ip = (req.ip || '').replace('::ffff:', '');
+  try {
+    if (!process.env.RUNPOD_API_KEY || !process.env.RUNPOD_ENDPOINT_ID) {
+      return res.status(503).json({ error: 'Service temporarily unavailable.' });
+    }
+    if (await isUserBanned(ip)) return res.status(403).json({ error: 'Your account has been suspended.' });
+    if (await isIPBlocked(ip)) return res.status(403).json({ error: 'Access denied.' });
+
+    let userId = null;
+    try {
+      const ah = req.headers.authorization || '';
+      const tok = ah.startsWith('Bearer ') ? ah.slice(7) : '';
+      if (tok) { const u = await getUserFromToken(tok); userId = u?.id || null; }
+    } catch (e) {}
+
+    // Daily limit: finished transcripts today + jobs still running right now.
+    const FREE_ANON_DAILY = 1;
+    const FREE_USER_DAILY = 3;
+    const used = (await countTodayTranscriptions({ userId, ip })) + (await countTodayRunningJobs({ userId, ip }));
+    if (!userId && used >= FREE_ANON_DAILY) {
+      return res.status(429).json({ error: "You've used your free transcript for today. Sign in with Google to get 3 per day, free.", needsAuth: true });
+    }
+    if (userId && used >= FREE_USER_DAILY) {
+      return res.status(429).json({ error: "You've reached your 3 free transcripts for today. Please come back tomorrow." });
+    }
+
+    const sp = String(req.body?.storagePath || '');
+    if (!/^[A-Za-z0-9._-]{6,80}$/.test(sp)) return res.status(400).json({ error: 'Invalid upload reference.' });
+    const originalName = (req.body?.originalName ? String(req.body.originalName) : 'audio').slice(0, 200);
+    const language = req.body?.language && req.body.language !== 'auto' ? String(req.body.language).slice(0, 10) : null;
+    const opts = {
+      timestamps: req.body?.timestamps === 'true' || req.body?.timestamps === true,
+      speakers: req.body?.speakers === 'true' || req.body?.speakers === true,
+      summary: req.body?.summary === 'true' || req.body?.summary === true
+    };
+
+    // Signed 6-hour link the GPU uses to fetch the file from the private bucket.
+    let audioUrl;
+    try { audioUrl = await createSignedDownloadUrl(sp, 21600); }
+    catch (e) { return res.status(400).json({ error: 'Uploaded file not found. Please try again.' }); }
+
+    const input = {
+      audio: audioUrl,
+      model: process.env.RUNPOD_WHISPER_MODEL || 'large-v3',
+      transcription: 'plain_text',
+      translate: false
+    };
+    if (language) input.language = language;
+
+    const rp = await runpodFetch('/run', { method: 'POST', body: JSON.stringify({ input }) });
+    if (!rp.ok) {
+      await logActivity('transcription_error', ip, { stage: 'runpod_start', status: rp.status });
+      return res.status(502).json({ error: 'Could not start transcription. Please try again.' });
+    }
+    const rj = await rp.json().catch(() => ({}));
+    const jobId = rj?.id;
+    if (!jobId) return res.status(502).json({ error: 'Could not start transcription. Please try again.' });
+
+    await createJob({ id: jobId, ip, userId, filename: originalName, storagePath: sp, options: opts });
+    await logActivity('transcription_started', ip, { filename: originalName, jobId, engine: 'runpod' });
+    res.json({ jobId });
+  } catch (err) {
+    await logActivity('transcription_error', ip, { error: err.message, stage: 'start' });
+    res.status(500).json({ error: 'Could not start transcription. Please try again.' });
+  }
+});
+
+// Poll a GPU job. When it completes, this formats the transcript, makes the
+// summary if asked, saves everything, and deletes the uploaded file.
+router.get('/status/:jobId', async (req, res) => {
+  const ip = (req.ip || '').replace('::ffff:', '');
+  try {
+    const jobId = String(req.params.jobId || '');
+    if (!/^[A-Za-z0-9_-]{8,80}$/.test(jobId)) return res.status(400).json({ error: 'Invalid job.' });
+    const job = await getJob(jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found.' });
+
+    // Finished earlier (e.g. the page was refreshed) — return the saved result.
+    if (job.status === 'done' && job.result_id) {
+      const t = await getTranscriptionById(job.result_id);
+      if (t) return res.json({ status: 'done', transcript: t.transcript, summary: t.summary || '', language: t.language, duration: t.duration_seconds, wordCount: t.word_count });
+      return res.status(410).json({ error: 'This transcript is no longer available.' });
+    }
+    if (job.status === 'failed') return res.status(502).json({ status: 'failed', error: 'Transcription failed. Please try again.' });
+
+    const rp = await runpodFetch(`/status/${jobId}`, { method: 'GET' });
+    if (!rp.ok) {
+      if (rp.status === 404) {
+        await markJob(jobId, { status: 'failed', error: 'expired' });
+        await removeFromStorage(job.storage_path);
+        return res.status(502).json({ status: 'failed', error: 'This transcription expired. Please try again.' });
+      }
+      return res.json({ status: 'processing' });
+    }
+    const rj = await rp.json().catch(() => ({}));
+    const st = rj?.status;
+
+    if (st === 'IN_QUEUE') return res.json({ status: 'queued' });
+    if (st === 'IN_PROGRESS') return res.json({ status: 'processing' });
+
+    if (st === 'COMPLETED') {
+      const out = rj.output || {};
+      const jopts = job.options || {};
+      const segments = Array.isArray(out.segments) ? out.segments : [];
+
+      let transcript = '';
+      if (jopts.timestamps && segments.length) {
+        segments.forEach((seg, i) => {
+          const mm = String(Math.floor((seg.start || 0) / 60)).padStart(2, '0');
+          const ss = String(Math.floor((seg.start || 0) % 60)).padStart(2, '0');
+          const spk = jopts.speakers ? `Speaker ${String.fromCharCode(65 + (i % 2))}: ` : '';
+          transcript += `[${mm}:${ss}] ${spk}${String(seg.text || '').trim()}\n\n`;
+        });
+      } else {
+        const raw = (typeof out.transcription === 'string' && out.transcription)
+          ? out.transcription
+          : segments.map(s => String(s.text || '').trim()).join(' ');
+        if (jopts.speakers) {
+          (raw.match(/[^.!?]+[.!?]+/g) || [raw]).forEach((s, i) => {
+            transcript += `Speaker ${String.fromCharCode(65 + (i % 2))}: ${s.trim()}\n\n`;
+          });
+        } else { transcript = raw; }
+      }
+      transcript = transcript.trim();
+
+      if (!transcript) {
+        await markJob(jobId, { status: 'failed', error: 'empty' });
+        await removeFromStorage(job.storage_path);
+        return res.status(502).json({ status: 'failed', error: 'No speech could be detected in this file.' });
+      }
+
+      const duration = segments.length ? Math.round(segments[segments.length - 1].end || 0) : 0;
+      const detectedLang = out.detected_language || null;
+
+      let summaryText = '';
+      if (jopts.summary) {
+        try {
+          const ck = process.env.ANTHROPIC_API_KEY;
+          if (ck) {
+            const sc = new AbortController();
+            const stm = setTimeout(() => sc.abort(), 30000);
+            try {
+              const sr = await fetch('https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-api-key': ck, 'anthropic-version': '2023-06-01' },
+                body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 300,
+                  messages: [{ role: 'user', content: `Summarise in 3 sentences:\n\n${transcript.slice(0, 3000)}` }] }),
+                signal: sc.signal
+              });
+              if (sr.ok) { const sd = await sr.json(); summaryText = sd.content?.[0]?.text || ''; }
+            } finally { clearTimeout(stm); }
+          }
+        } catch (e) {}
+      }
+
+      const wordCount = transcript.split(/\s+/).filter(Boolean).length;
+      const saved = await saveTranscription({ ip: job.ip || ip, filename: job.filename, transcript, summary: summaryText, language: detectedLang, duration, wordCount, userId: job.user_id });
+      await markJob(jobId, { status: 'done', result_id: saved?.id || null });
+      await updateStats('transcribe', { duration, language: detectedLang });
+      await upsertUser(job.ip || ip, 'transcribe', { duration });
+      await logActivity('transcription_complete', ip, { filename: job.filename, duration, language: detectedLang, words: wordCount, engine: 'runpod' });
+      await removeFromStorage(job.storage_path);
+
+      return res.json({ status: 'done', transcript, summary: summaryText, language: detectedLang, duration, wordCount });
+    }
+
+    // FAILED / CANCELLED / TIMED_OUT
+    await markJob(jobId, { status: 'failed', error: String(st || 'failed') });
+    await removeFromStorage(job.storage_path);
+    await logActivity('transcription_error', ip, { jobId, stage: 'runpod', status: st });
+    return res.status(502).json({ status: 'failed', error: st === 'TIMED_OUT' ? 'This recording took too long to transcribe. Please try a shorter file.' : 'Transcription failed. Please try again.' });
+  } catch (err) {
+    // Transient hiccup (network/db): tell the page to just keep polling.
+    return res.json({ status: 'processing' });
+  }
+});
+
 router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
   const ip = (req.ip || '').replace('::ffff:', '');
+  let cleanupPath = null;
   try {
     // FIX #4: Check both isUserBanned AND isIPBlocked
     if (await isUserBanned(ip)) return res.status(403).json({ error: 'Your account has been suspended.' });
@@ -45,7 +273,6 @@ router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
     const apiKey = process.env.OPENAI_API_KEY;
     // FIX #2: Remove x-openai-key header acceptance — key is server-side only
     if (!apiKey) return res.status(503).json({ error: 'Service temporarily unavailable.' });
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
     // Identify the user first (if signed in) — needed for the daily limit below.
     let userId = null;
@@ -67,23 +294,51 @@ router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
     }
 
     const settings = await getSettings();
-    const maxSize = (settings.max_file_size_mb || 500) * 1024 * 1024;
-    if (req.file.size > maxSize) return res.status(413).json({ error: `File too large. Max: ${settings.max_file_size_mb || 500}MB` });
+
+    // Resolve the audio source. New path: the browser uploaded straight to Supabase
+    // Storage (bypassing Vercel's 4.5MB limit) and sent us the path. Legacy path:
+    // a normal multipart upload (still accepted for small files / backward compat).
+    let fileBuffer, srcName, srcMime, srcSize;
+    if (req.body && req.body.storagePath) {
+      const sp = String(req.body.storagePath);
+      if (!/^[A-Za-z0-9._-]{6,80}$/.test(sp)) return res.status(400).json({ error: 'Invalid upload reference.' });
+      cleanupPath = sp;
+      try { fileBuffer = await downloadFromStorage(sp); }
+      catch (e) { return res.status(400).json({ error: 'Uploaded file not found. Please try again.' }); }
+      srcName = (req.body.originalName ? String(req.body.originalName) : 'audio.mp3').slice(0, 200);
+      srcMime = (req.body.mimeType ? String(req.body.mimeType) : '') || 'audio/mpeg';
+      srcSize = fileBuffer.length;
+    } else if (req.file) {
+      fileBuffer = req.file.buffer;
+      srcName = req.file.originalname;
+      srcMime = req.file.mimetype;
+      srcSize = req.file.size;
+    } else {
+      return res.status(400).json({ error: 'No file uploaded.' });
+    }
+
+    // OpenAI Whisper rejects anything over 25MB on every model — hard cap here.
+    const OPENAI_MAX = 25 * 1024 * 1024;
+    if (srcSize > OPENAI_MAX) {
+      if (cleanupPath) await removeFromStorage(cleanupPath);
+      return res.status(413).json({ error: 'File too large. The most we can transcribe is 25 MB — try a shorter clip or compress the audio first.' });
+    }
 
     const { timestamps, speakers, summary, language } = req.body;
-    const fixedName = fixFilename(req.file.originalname, req.file.mimetype);
+    const fixedName = fixFilename(srcName, srcMime);
 
-    await logActivity('transcription_started', ip, { filename: fixedName, size: req.file.size });
+    await logActivity('transcription_started', ip, { filename: fixedName, size: srcSize });
 
     const formData = new FormData();
-    formData.append('file', req.file.buffer, { filename: fixedName, contentType: req.file.mimetype });
+    formData.append('file', fileBuffer, { filename: fixedName, contentType: srcMime });
     formData.append('model', settings.whisper_model || 'whisper-1');
     formData.append('response_format', timestamps === 'true' ? 'verbose_json' : 'json');
     if (language && language !== 'auto') formData.append('language', language);
 
-    // FIX #9: Add timeout to fetch calls
+    // Vercel's free plan kills any function at 60s, so abort at 50s — that lets us
+    // clean up and return a clear message instead of an opaque gateway timeout.
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000); // 2 min timeout
+    const timeout = setTimeout(() => controller.abort(), 50000);
 
     let whisperRes;
     try {
@@ -93,11 +348,16 @@ router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
         body: formData,
         signal: controller.signal
       });
+    } catch (e) {
+      if (cleanupPath) await removeFromStorage(cleanupPath);
+      if (e.name === 'AbortError') return res.status(504).json({ error: 'This recording is taking too long to transcribe. Please try a shorter clip (under about 20 minutes).' });
+      throw e;
     } finally {
       clearTimeout(timeout);
     }
 
     if (!whisperRes.ok) {
+      if (cleanupPath) await removeFromStorage(cleanupPath);
       const err = await whisperRes.json().catch(() => ({}));
       await logActivity('transcription_error', ip, { status: whisperRes.status });
       if (whisperRes.status === 401) return res.status(503).json({ error: 'Service configuration error.' });
@@ -151,8 +411,10 @@ router.post('/', apiRateLimit, upload.single('file'), async (req, res) => {
     await upsertUser(ip, 'transcribe', { duration: data.duration });
     await logActivity('transcription_complete', ip, { filename: fixedName, duration: data.duration, language: data.language, words: wordCount });
 
+    if (cleanupPath) await removeFromStorage(cleanupPath);
     res.json({ transcript: transcript.trim(), summary: summaryText, language: data.language, duration: data.duration, wordCount });
   } catch (err) {
+    if (cleanupPath) await removeFromStorage(cleanupPath);
     await logActivity('transcription_error', ip, { error: err.message });
     // FIX: Never expose internal error details
     res.status(500).json({ error: 'An error occurred. Please try again.' });
