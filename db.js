@@ -55,6 +55,19 @@ export async function getJob(id) {
 export async function markJob(id, fields) {
   try { await sb().from('transcribe_jobs').update(fields).eq('id', id); } catch (e) {}
 }
+// Atomically claim a finished job for finalizing (running -> finalizing).
+// Returns true only for the ONE caller that wins, so results never save twice.
+export async function claimJob(id) {
+  const { data } = await sb().from('transcribe_jobs').update({ status: 'finalizing' })
+    .eq('id', id).eq('status', 'running').select('id');
+  return !!(data && data.length);
+}
+// Find a job by its storage path (used by the RunPod webhook).
+export async function getJobByStoragePath(sp) {
+  const { data } = await sb().from('transcribe_jobs').select('*')
+    .eq('storage_path', sp).order('created_at', { ascending: false }).limit(1);
+  return (data && data[0]) || null;
+}
 // Jobs still running today — counted toward the daily limit so it can't be bypassed
 // by starting several jobs before the first one finishes.
 export async function countTodayRunningJobs({ userId, ip }) {
