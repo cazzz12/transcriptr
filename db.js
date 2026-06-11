@@ -144,8 +144,8 @@ export async function isUserBanned(ip) {
   const { data } = await sb().from('users').select('banned').eq('ip', (ip||'').replace('::ffff:','')).maybeSingle();
   return data?.banned||false;
 }
-export async function saveTranscription({ ip, filename, transcript, language, duration, wordCount, summary, userId }) {
-  const { data } = await sb().from('transcriptions').insert({ ip:(ip||'').replace('::ffff:',''), user_id: userId||null, filename, transcript, summary:summary||null, language:language||null, duration_seconds:Math.round(duration||0), word_count:wordCount||0, created_at:new Date().toISOString() }).select().single();
+export async function saveTranscription({ ip, filename, transcript, language, duration, wordCount, summary, userId, segments }) {
+  const { data } = await sb().from('transcriptions').insert({ ip:(ip||'').replace('::ffff:',''), user_id: userId||null, filename, transcript, summary:summary||null, language:language||null, duration_seconds:Math.round(duration||0), word_count:wordCount||0, segments: segments||null, created_at:new Date().toISOString() }).select().single();
   return data;
 }
 
