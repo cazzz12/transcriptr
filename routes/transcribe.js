@@ -2,7 +2,8 @@ import express from 'express';
 import multer from 'multer';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
-import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings, getUserFromToken, getUserTranscriptions, getUserTranscriptById, countTodayTranscriptions, createUploadUrl, downloadFromStorage, removeFromStorage, createSignedDownloadUrl, createJob, getJob, markJob, countTodayRunningJobs, getTranscriptionById, deleteUserTranscript } from '../db.js';
+import crypto from 'crypto';
+import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings, getUserFromToken, getUserTranscriptions, getUserTranscriptById, countTodayTranscriptions, createUploadUrl, downloadFromStorage, removeFromStorage, createSignedDownloadUrl, createJob, getJob, markJob, countTodayRunningJobs, getTranscriptionById, deleteUserTranscript, claimJob, getJobByStoragePath } from '../db.js';
 import { apiRateLimit, convertLogRateLimit } from '../middleware/security.js';
 
 const router = express.Router();
@@ -99,6 +100,12 @@ function parseSrtToSegments(srt) {
   return segs;
 }
 
+// HMAC signature for webhook URLs — proves a callback really belongs to a job
+// we created (signed with our own secret; unforgeable from outside).
+function hookSig(v) {
+  return crypto.createHmac('sha256', process.env.JWT_SECRET || '').update('hook:' + String(v)).digest('hex').slice(0, 32);
+}
+
 // Start a GPU transcription job for a file the browser already uploaded to Supabase Storage.
 router.post('/start', apiRateLimit, async (req, res) => {
   const ip = (req.ip || '').replace('::ffff:', '');
@@ -133,7 +140,6 @@ router.post('/start', apiRateLimit, async (req, res) => {
     const language = req.body?.language && req.body.language !== 'auto' ? String(req.body.language).slice(0, 10) : null;
     const opts = {
       timestamps: req.body?.timestamps === 'true' || req.body?.timestamps === true,
-      speakers: req.body?.speakers === 'true' || req.body?.speakers === true,
       summary: req.body?.summary === 'true' || req.body?.summary === true,
       translateEn: req.body?.translateEn === 'true' || req.body?.translateEn === true
     };
@@ -145,7 +151,7 @@ router.post('/start', apiRateLimit, async (req, res) => {
 
     const input = {
       audio: audioUrl,
-      model: process.env.RUNPOD_WHISPER_MODEL || 'large-v3',
+      model: process.env.RUNPOD_WHISPER_MODEL || 'turbo',
       transcription: 'plain_text',
       translate: !!opts.translateEn
     };
@@ -153,7 +159,11 @@ router.post('/start', apiRateLimit, async (req, res) => {
     if (opts.translateEn) input.translation = 'srt';
     if (language) input.language = language;
 
-    const rp = await runpodFetch('/run', { method: 'POST', body: JSON.stringify({ input }) });
+    // Register a signed webhook: RunPod calls us when the job finishes, so the
+    // transcript completes and saves even if the visitor closes the page.
+    const base = process.env.PUBLIC_BASE_URL || 'https://transcriptr.nl';
+    const webhook = `${base}/api/transcribe/hook?sp=${encodeURIComponent(sp)}&sig=${hookSig(sp)}`;
+    const rp = await runpodFetch('/run', { method: 'POST', body: JSON.stringify({ input, webhook }) });
     if (!rp.ok) {
       await logActivity('transcription_error', ip, { stage: 'runpod_start', status: rp.status });
       return res.status(502).json({ error: 'Could not start transcription. Please try again.' });
@@ -170,6 +180,83 @@ router.post('/start', apiRateLimit, async (req, res) => {
     res.status(500).json({ error: 'Could not start transcription. Please try again.' });
   }
 });
+
+// Shared completion: build segments + transcript, summarise, save, clean up.
+// Called by BOTH the poll endpoint and the RunPod webhook, after an atomic
+// claim, so a job can never be saved twice.
+async function finalizeCompletedJob(job, out, ip) {
+  const jopts = job.options || {};
+
+  // Build clean segments with REAL timings. For "Translate to English" jobs the
+  // English text arrives as SRT (to keep timings) — parse it back.
+  let segs = [];
+  const hasTranslation = !!(jopts.translateEn && typeof out.translation === 'string' && out.translation.trim());
+  if (hasTranslation) segs = parseSrtToSegments(out.translation);
+  const usedTranslation = hasTranslation && segs.length > 0;
+  if (!segs.length && Array.isArray(out.segments)) {
+    segs = out.segments.map(sgm => ({
+      start: Math.round((sgm.start || 0) * 100) / 100,
+      end: Math.round((sgm.end || 0) * 100) / 100,
+      text: String(sgm.text || '').trim()
+    })).filter(sgm => sgm.text);
+  }
+
+  let transcript = '';
+  if (jopts.timestamps && segs.length) {
+    segs.forEach((seg) => {
+      const mm = String(Math.floor((seg.start || 0) / 60)).padStart(2, '0');
+      const ss = String(Math.floor((seg.start || 0) % 60)).padStart(2, '0');
+      transcript += `[${mm}:${ss}] ${seg.text}\n\n`;
+    });
+  } else {
+    transcript = usedTranslation
+      ? segs.map(sgm => sgm.text).join(' ')
+      : ((typeof out.transcription === 'string' && out.transcription)
+          ? out.transcription
+          : segs.map(sgm => sgm.text).join(' '));
+  }
+  transcript = transcript.trim();
+
+  if (!transcript) {
+    await markJob(job.id, { status: 'failed', error: 'empty' });
+    await removeFromStorage(job.storage_path);
+    return null;
+  }
+
+  const duration = segs.length ? Math.round(segs[segs.length - 1].end || 0) : 0;
+  const detectedLang = usedTranslation ? 'en' : (out.detected_language || null);
+
+  let summaryText = '';
+  if (jopts.summary) {
+    try {
+      const ck = process.env.ANTHROPIC_API_KEY;
+      if (ck) {
+        const sc = new AbortController();
+        const stm = setTimeout(() => sc.abort(), 30000);
+        try {
+          const sr = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': ck, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 300,
+              messages: [{ role: 'user', content: `Summarise in 3 sentences:\n\n${transcript.slice(0, 3000)}` }] }),
+            signal: sc.signal
+          });
+          if (sr.ok) { const sd = await sr.json(); summaryText = sd.content?.[0]?.text || ''; }
+        } finally { clearTimeout(stm); }
+      }
+    } catch (e) {}
+  }
+
+  const wordCount = transcript.split(/\s+/).filter(Boolean).length;
+  const saved = await saveTranscription({ ip: job.ip || ip, filename: job.filename, transcript, summary: summaryText, language: detectedLang, duration, wordCount, userId: job.user_id, segments: segs.length ? segs : null });
+  await markJob(job.id, { status: 'done', result_id: saved?.id || null });
+  await updateStats('transcribe', { duration, language: detectedLang });
+  await upsertUser(job.ip || ip, 'transcribe', { duration });
+  await logActivity('transcription_complete', ip, { filename: job.filename, duration, language: detectedLang, words: wordCount, engine: 'runpod' });
+  await removeFromStorage(job.storage_path);
+
+  return { transcript, summary: summaryText, language: detectedLang, duration, wordCount, segments: segs };
+}
 
 // Poll a GPU job. When it completes, this formats the transcript, makes the
 // summary if asked, saves everything, and deletes the uploaded file.
@@ -205,84 +292,16 @@ router.get('/status/:jobId', async (req, res) => {
     if (st === 'IN_PROGRESS') return res.json({ status: 'processing' });
 
     if (st === 'COMPLETED') {
-      const out = rj.output || {};
-      const jopts = job.options || {};
-
-      // Build clean segments with REAL timings. For "Translate to English" jobs
-      // the English text arrives as SRT (to keep timings) — parse it back.
-      let segs = [];
-      const hasTranslation = !!(jopts.translateEn && typeof out.translation === 'string' && out.translation.trim());
-      if (hasTranslation) segs = parseSrtToSegments(out.translation);
-      const usedTranslation = hasTranslation && segs.length > 0;
-      if (!segs.length && Array.isArray(out.segments)) {
-        segs = out.segments.map(sgm => ({
-          start: Math.round((sgm.start || 0) * 100) / 100,
-          end: Math.round((sgm.end || 0) * 100) / 100,
-          text: String(sgm.text || '').trim()
-        })).filter(sgm => sgm.text);
+      // Atomic claim: whoever flips running->finalizing first does the save.
+      // (The webhook may be finishing this job at the same moment.)
+      const claimed = await claimJob(jobId);
+      if (!claimed) {
+        // Someone else is saving it — the next poll will pick up the result.
+        return res.json({ status: 'processing' });
       }
-
-      let transcript = '';
-      if (jopts.timestamps && segs.length) {
-        segs.forEach((seg, i) => {
-          const mm = String(Math.floor((seg.start || 0) / 60)).padStart(2, '0');
-          const ss = String(Math.floor((seg.start || 0) % 60)).padStart(2, '0');
-          const spk = jopts.speakers ? `Speaker ${String.fromCharCode(65 + (i % 2))}: ` : '';
-          transcript += `[${mm}:${ss}] ${spk}${seg.text}\n\n`;
-        });
-      } else {
-        const raw = usedTranslation
-          ? segs.map(sgm => sgm.text).join(' ')
-          : ((typeof out.transcription === 'string' && out.transcription)
-              ? out.transcription
-              : segs.map(sgm => sgm.text).join(' '));
-        if (jopts.speakers) {
-          (raw.match(/[^.!?]+[.!?]+/g) || [raw]).forEach((sx, i) => {
-            transcript += `Speaker ${String.fromCharCode(65 + (i % 2))}: ${sx.trim()}\n\n`;
-          });
-        } else { transcript = raw; }
-      }
-      transcript = transcript.trim();
-
-      if (!transcript) {
-        await markJob(jobId, { status: 'failed', error: 'empty' });
-        await removeFromStorage(job.storage_path);
-        return res.status(502).json({ status: 'failed', error: 'No speech could be detected in this file.' });
-      }
-
-      const duration = segs.length ? Math.round(segs[segs.length - 1].end || 0) : 0;
-      const detectedLang = usedTranslation ? 'en' : (out.detected_language || null);
-
-      let summaryText = '';
-      if (jopts.summary) {
-        try {
-          const ck = process.env.ANTHROPIC_API_KEY;
-          if (ck) {
-            const sc = new AbortController();
-            const stm = setTimeout(() => sc.abort(), 30000);
-            try {
-              const sr = await fetch('https://api.anthropic.com/v1/messages', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-api-key': ck, 'anthropic-version': '2023-06-01' },
-                body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 300,
-                  messages: [{ role: 'user', content: `Summarise in 3 sentences:\n\n${transcript.slice(0, 3000)}` }] }),
-                signal: sc.signal
-              });
-              if (sr.ok) { const sd = await sr.json(); summaryText = sd.content?.[0]?.text || ''; }
-            } finally { clearTimeout(stm); }
-          }
-        } catch (e) {}
-      }
-
-      const wordCount = transcript.split(/\s+/).filter(Boolean).length;
-      const saved = await saveTranscription({ ip: job.ip || ip, filename: job.filename, transcript, summary: summaryText, language: detectedLang, duration, wordCount, userId: job.user_id, segments: segs.length ? segs : null });
-      await markJob(jobId, { status: 'done', result_id: saved?.id || null });
-      await updateStats('transcribe', { duration, language: detectedLang });
-      await upsertUser(job.ip || ip, 'transcribe', { duration });
-      await logActivity('transcription_complete', ip, { filename: job.filename, duration, language: detectedLang, words: wordCount, engine: 'runpod' });
-      await removeFromStorage(job.storage_path);
-
-      return res.json({ status: 'done', transcript, summary: summaryText, language: detectedLang, duration, wordCount, segments: segs });
+      const result = await finalizeCompletedJob(job, rj.output || {}, ip);
+      if (!result) return res.status(502).json({ status: 'failed', error: 'No speech could be detected in this file.' });
+      return res.json(Object.assign({ status: 'done' }, result));
     }
 
     // FAILED / CANCELLED / TIMED_OUT
@@ -293,6 +312,42 @@ router.get('/status/:jobId', async (req, res) => {
   } catch (err) {
     // Transient hiccup (network/db): tell the page to just keep polling.
     return res.json({ status: 'processing' });
+  }
+});
+
+// RunPod calls this when a job finishes, so transcripts complete and save even
+// if the visitor closed the page. Authenticated by an HMAC signature we created
+// at job start; we also never trust the posted payload — we re-fetch the
+// authoritative status from RunPod ourselves before saving anything.
+router.post('/hook', async (req, res) => {
+  try {
+    const sp = String(req.query.sp || '');
+    const sig = String(req.query.sig || '');
+    if (!/^[A-Za-z0-9._-]{6,80}$/.test(sp)) return res.status(400).json({ ok: false });
+    const expected = hookSig(sp);
+    if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+      return res.status(403).json({ ok: false });
+    }
+    const job = await getJobByStoragePath(sp);
+    if (!job || job.status !== 'running') return res.json({ ok: true }); // already handled elsewhere
+
+    const rp = await runpodFetch(`/status/${job.id}`, { method: 'GET' });
+    if (!rp.ok) return res.status(502).json({ ok: false }); // RunPod retries on non-2xx
+    const rj = await rp.json().catch(() => ({}));
+
+    if (rj?.status === 'COMPLETED') {
+      const claimed = await claimJob(job.id);
+      if (claimed) await finalizeCompletedJob(job, rj.output || {}, (req.ip || '').replace('::ffff:', ''));
+      return res.json({ ok: true });
+    }
+    if (rj?.status === 'FAILED' || rj?.status === 'CANCELLED' || rj?.status === 'TIMED_OUT') {
+      await markJob(job.id, { status: 'failed', error: String(rj.status) });
+      await removeFromStorage(job.storage_path);
+      return res.json({ ok: true });
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false });
   }
 });
 
