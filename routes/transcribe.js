@@ -2,7 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
-import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings, getUserFromToken, getUserTranscriptions, getUserTranscriptById, countTodayTranscriptions, createUploadUrl, downloadFromStorage, removeFromStorage, createSignedDownloadUrl, createJob, getJob, markJob, countTodayRunningJobs, getTranscriptionById } from '../db.js';
+import { logActivity, updateStats, upsertUser, isUserBanned, isIPBlocked, saveTranscription, getSettings, getUserFromToken, getUserTranscriptions, getUserTranscriptById, countTodayTranscriptions, createUploadUrl, downloadFromStorage, removeFromStorage, createSignedDownloadUrl, createJob, getJob, markJob, countTodayRunningJobs, getTranscriptionById, deleteUserTranscript } from '../db.js';
 import { apiRateLimit, convertLogRateLimit } from '../middleware/security.js';
 
 const router = express.Router();
@@ -467,6 +467,20 @@ router.get('/mine/:id', async (req, res) => {
     res.json({ item });
   } catch (e) {
     res.status(500).json({ error: 'Could not load that transcript.' });
+  }
+});
+
+// Delete one of my transcripts permanently (GDPR right to erasure)
+router.delete('/mine/:id', async (req, res) => {
+  try {
+    const user = await requireUser(req, res);
+    if (!user) return;
+    const ok = await deleteUserTranscript(user.id, req.params.id);
+    if (!ok) return res.status(404).json({ error: 'Transcript not found.' });
+    await logActivity('transcript_deleted', (req.ip || '').replace('::ffff:', ''), { id: String(req.params.id) });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not delete that transcript.' });
   }
 });
 
