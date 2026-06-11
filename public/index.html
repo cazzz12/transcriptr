@@ -1404,6 +1404,7 @@ footer {
     <div class="opt-chip on" id="chip-ts" onclick="toggleChip('chip-ts')"><div class="chip-pip"></div><span data-i18n="opt_timestamps">Timestamps</span></div>
     <div class="opt-chip on" id="chip-punct" onclick="toggleChip('chip-punct')"><div class="chip-pip"></div><span data-i18n="opt_punct">Smart punctuation</span></div>
     <div class="opt-chip" id="chip-sum" onclick="toggleChip('chip-sum')"><div class="chip-pip"></div><span data-i18n="opt_summary">AI summary</span></div>
+    <div class="opt-chip" id="chip-spk" onclick="toggleChip('chip-spk')"><div class="chip-pip"></div><span data-i18n="opt_speakers">Speaker labels</span></div>
     <div class="opt-chip" id="chip-en" onclick="toggleChip('chip-en')"><div class="chip-pip"></div><span data-i18n="opt_english">Translate to English</span></div>
   </div>
 
@@ -1764,6 +1765,7 @@ window.runTranscription = async function() {
   const withTs  = document.getElementById('chip-ts').classList.contains('on');
   const withSum = document.getElementById('chip-sum').classList.contains('on');
   const withEn  = document.getElementById('chip-en') ? document.getElementById('chip-en').classList.contains('on') : false;
+  const withSpk = document.getElementById('chip-spk') ? document.getElementById('chip-spk').classList.contains('on') : false;
   const lang    = document.getElementById('lang-select') ? document.getElementById('lang-select').value : 'auto';
 
   // Only two inputs are supported: a YouTube link, or an uploaded file.
@@ -1865,7 +1867,7 @@ window.runTranscription = async function() {
       var startRes = await fetch('/api/transcribe/start', {
         method: 'POST',
         headers: Object.assign({ 'Content-Type': 'application/json', 'X-Requested-With': 'fetch' }, authH),
-        body: JSON.stringify({ storagePath: slot.path, originalName: fileToSend.name || 'audio', timestamps: withTs ? 'true' : 'false', summary: withSum ? 'true' : 'false', translateEn: withEn ? 'true' : 'false', language: lang })
+        body: JSON.stringify({ storagePath: slot.path, originalName: fileToSend.name || 'audio', timestamps: withTs ? 'true' : 'false', speakers: withSpk ? 'true' : 'false', summary: withSum ? 'true' : 'false', translateEn: withEn ? 'true' : 'false', language: lang })
       });
       if (!startRes.ok) { var se2 = await startRes.json().catch(()=>({})); var e2 = new Error(se2.error || (startRes.status===429 ? 'Daily limit reached.' : 'Could not start transcription.')); if (startRes.status===429 && se2.needsAuth) e2.needsAuth = true; throw e2; }
       var job = await startRes.json();
@@ -2007,8 +2009,8 @@ function showResult(text, lang, duration) {
 // ── Real subtitles from GPU segment timings (the old buildSrt below guessed timing
 //    from text length; it remains only as a fallback for old transcripts). ──
 function fmtSubTime(t, sep){ t=Math.max(0,t||0); var h=Math.floor(t/3600),m=Math.floor((t%3600)/60),sc=Math.floor(t%60),ms=Math.round((t-Math.floor(t))*1000); if(ms===1000){ms=0;sc+=1;if(sc===60){sc=0;m+=1;if(m===60){m=0;h+=1;}}} return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sc).padStart(2,'0')+sep+String(ms).padStart(3,'0'); }
-window.buildSrtFromSegments = function(segs){ var out='',i=1; (segs||[]).forEach(function(sg){ if(!sg||!sg.text)return; var st=sg.start||0; var en=(sg.end&&sg.end>st)?sg.end:st+2; out+=(i++)+'\n'+fmtSubTime(st,',')+' --> '+fmtSubTime(en,',')+'\n'+String(sg.text).trim()+'\n\n'; }); return out; };
-window.buildVttFromSegments = function(segs){ var out='WEBVTT\n\n'; (segs||[]).forEach(function(sg){ if(!sg||!sg.text)return; var st=sg.start||0; var en=(sg.end&&sg.end>st)?sg.end:st+2; out+=fmtSubTime(st,'.')+' --> '+fmtSubTime(en,'.')+'\n'+String(sg.text).trim()+'\n\n'; }); return out; };
+window.buildSrtFromSegments = function(segs){ var out='',i=1; (segs||[]).forEach(function(sg){ if(!sg||!sg.text)return; var st=sg.start||0; var en=(sg.end&&sg.end>st)?sg.end:st+2; var sp1=sg.speaker?('Speaker '+sg.speaker+': '):''; out+=(i++)+'\n'+fmtSubTime(st,',')+' --> '+fmtSubTime(en,',')+'\n'+sp1+String(sg.text).trim()+'\n\n'; }); return out; };
+window.buildVttFromSegments = function(segs){ var out='WEBVTT\n\n'; (segs||[]).forEach(function(sg){ if(!sg||!sg.text)return; var st=sg.start||0; var en=(sg.end&&sg.end>st)?sg.end:st+2; var sp2=sg.speaker?('Speaker '+sg.speaker+': '):''; out+=fmtSubTime(st,'.')+' --> '+fmtSubTime(en,'.')+'\n'+sp2+String(sg.text).trim()+'\n\n'; }); return out; };
 function buildSrt(text) {
   const lines=text.split('\n').filter(l=>l.trim());
   let out='',i=1,s=0;
